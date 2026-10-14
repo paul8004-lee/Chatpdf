@@ -1,4 +1,4 @@
-gradio
+gradio==6.30.0
 langchain
 langchain-community
 langchain-openai
