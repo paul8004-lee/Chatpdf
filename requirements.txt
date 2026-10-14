@@ -6,3 +6,4 @@ langchain-text-splitters
 chromadb
 pypdf
 python-dotenv
+langchain-chroma
