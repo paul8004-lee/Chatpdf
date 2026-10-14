@@ -30,8 +30,6 @@ python app.py
 ## 해결하려는 문제와 대상 사용자
 (작성 예정)
 
-## 사용 문서와 출처
-[docs/sources.md](docs/sources.md) 참고
 
 ## 개선 내역과 성능 비교
 (작성 예정)
