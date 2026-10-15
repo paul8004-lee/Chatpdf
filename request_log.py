@@ -33,6 +33,7 @@ class RequestLog:
         self.status = "success"
         self.tokens = dict(input_tokens=0, output_tokens=0, total_tokens=0)
         self.usage_complete = True
+        self._usage_lock = threading.Lock()
 
     def redact(self, value):
         if isinstance(value, dict):
@@ -49,11 +50,13 @@ class RequestLog:
         return value
 
     def emit(self, event, **fields):
-        record = self.redact(dict(
+        record = dict(
             schema_version=1, time=datetime.now(timezone.utc).isoformat(),
             request_id=self.request_id, operation=self.operation,
-            stage=self.stage, event=event, **fields,
-        ))
+            stage=self.stage, event=event,
+        )
+        record.update(fields)
+        record = self.redact(record)
         try:
             line = json.dumps(record, ensure_ascii=False) + "\n"
             with _write_lock:
@@ -76,18 +79,14 @@ class RequestLog:
             counts = dict(input_tokens=usage.get("input_tokens", usage.get("prompt_tokens", 0)),
                           output_tokens=usage.get("output_tokens", usage.get("completion_tokens", 0)))
             counts["total_tokens"] = usage.get("total_tokens", sum(counts.values()))
-            for key, value in counts.items():
-                self.tokens[key] += value
+            with self._usage_lock:
+                for key, value in counts.items():
+                    self.tokens[key] += value
             fields.update(counts)
         else:
             self.usage_complete = False
             fields.update(input_tokens=None, output_tokens=None, total_tokens=None, reason=reason)
-        previous = self.stage
-        self.stage = stage or previous
-        try:
-            self.emit("token_usage", **fields)
-        finally:
-            self.stage = previous
+        self.emit("token_usage", stage=stage or self.stage, **fields)
 
 
 @contextmanager
@@ -158,13 +157,14 @@ def stage(name):
 
 class TokenUsageCallback(BaseCallbackHandler):
     """Read provider usage from completed (including streamed) chat results."""
-    def __init__(self, trace, model=None):
+    def __init__(self, trace, model=None, stage=None):
         self.trace = trace
         self.model = model
+        self.stage = stage
         self.runs = {}
 
     def on_chat_model_start(self, serialized, messages, *, run_id, metadata=None, **kwargs):
-        self.runs[run_id] = (self.trace.stage, (metadata or {}).get("ls_model_name") or self.model)
+        self.runs[run_id] = (self.stage or self.trace.stage, (metadata or {}).get("ls_model_name") or self.model)
 
     def on_llm_end(self, response, *, run_id, **kwargs):
         stage_name, model = self.runs.pop(run_id, (self.trace.stage, self.model))

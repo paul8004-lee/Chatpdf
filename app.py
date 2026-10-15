@@ -1,9 +1,12 @@
 # ===== Step 1. PDF 처리 (feature/pdf-processing) =====
+import hashlib
 import logging
+import time
 import uuid
 import json
 from datetime import date
 from pydantic import BaseModel, Field
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -14,7 +17,6 @@ from langchain_chroma import Chroma
 import request_log
 from report_library import ReportLibrary, DEFAULT_MANIFEST, classify_question, select_reports, format_catalog
 import base64
-import os
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
@@ -28,27 +30,32 @@ except ImportError:
 
 NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
 
+# 시각 청킹 비용·시간 상한 (#74)
+# - 35쪽 PDF에서 표·이미지마다 순서대로 호출해 등록이 145초 걸렸음 → 상한·중복 제거·병렬 호출
+MAX_VISION_CALLS = 20        # PDF 하나당 GPT 호출(이미지 분석·표 요약) 최대 횟수. 넘는 요소는 건너뜀
+VISION_MAX_WORKERS = 4       # 동시에 보내는 호출 수(속도 제한에 걸리지 않을 정도로 작게)
+MIN_IMAGE_SIDE = 120         # 가로·세로가 이보다 작은 이미지는 아이콘·로고로 보고 제외
+MIN_IMAGE_BYTES = 4096       # 파일이 이보다 작은 큰 이미지는 단색 띠·배경 장식(실측 650~1,900바이트)으로 보고 제외
+MAX_IMAGE_ASPECT = 5         # 가로:세로(또는 세로:가로)가 이보다 길쭉하면 구분선·띠 장식으로 보고 제외
+# 표는 to_markdown 원문이 이미 수치를 그대로 담고, 같은 내용이 텍스트 청크·페이지 원문(#37)에도 있어
+# GPT 요약은 기본으로 끔. 켜면 표 요약도 MAX_VISION_CALLS 안에서 함께 처리됨
+SUMMARIZE_TABLES = False
+
+
 # ==========================================
 # 표 / 이미지 전담 청킹 클래스 정의
 # ==========================================
 class VisualElementChunker:
     """PDF 내에서 일반 텍스트는 건너뛰고, '표(Table)'와 '이미지/차트(Image)'만 전담으로 추출 및 요약 청킹"""
 
-    def __init__(
-        self,
-        api_key: str,
-        model_name: str = "gpt-4o-mini",
-        image_save_dir: str = "./extracted_images",
-    ):
-        trace = request_log.current()
-        callbacks = [request_log.TokenUsageCallback(trace, model_name)] if trace else []
-        self.llm = ChatOpenAI(model=model_name, temperature=0.0, api_key=api_key, callbacks=callbacks)
-        self.image_save_dir = image_save_dir
-        os.makedirs(self.image_save_dir, exist_ok=True)
+    def __init__(self, api_key: str, model_name: str = "gpt-4o-mini"):
+        self.model_name = model_name
+        self.llm = ChatOpenAI(model=model_name, temperature=0.0, api_key=api_key)
 
-    def _summarize_image(self, image_path: str) -> str:
-        with open(image_path, "rb") as f:
-            b64_image = base64.b64encode(f.read()).decode("utf-8")
+    def _summarize_image(self, image_bytes: bytes, ext: str = "png", config=None) -> str:
+        # 이미지는 파일로 저장하지 않고 메모리에서 바로 보냄 (#74: ./extracted_images가 계속 쌓이던 문제)
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        mime = "jpeg" if ext in ("jpg", "jpeg") else ext
 
         prompt = """
         당신은 데이터 시각화 및 문서 분석 전문가입니다.
@@ -63,15 +70,14 @@ class VisualElementChunker:
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+                    "image_url": {"url": f"data:image/{mime};base64,{b64_image}"},
                 },
             ]
         )
-        with request_log.stage("image_summary"):
-            response = self.llm.invoke([message])
+        response = self.llm.invoke([message], config=config)
         return response.content
 
-    def _summarize_table(self, table_markdown: str) -> str:
+    def _summarize_table(self, table_markdown: str, config=None) -> str:
         prompt = f"""
         다음 표의 구조와 수치 데이터를 분석하여 핵심 요약문을 작성하세요.
         사용자가 자연어로 검색할 때 이 표가 잘 검색될 수 있도록 주요 항목명, 수치, 결론을 포함하세요.
@@ -79,71 +85,125 @@ class VisualElementChunker:
         [표 데이터]
         {table_markdown}
         """
-        with request_log.stage("table_summary"):
-            response = self.llm.invoke(prompt)
+        response = self.llm.invoke(prompt, config=config)
         return response.content
 
+    @staticmethod
+    def _is_decorative(base_image) -> bool:
+        """아이콘·로고·구분선·단색 배경처럼 내용이 없는 이미지인지 (#74)"""
+        width, height = base_image["width"], base_image["height"]
+        if width < MIN_IMAGE_SIDE or height < MIN_IMAGE_SIDE:
+            return True
+        if len(base_image["image"]) < MIN_IMAGE_BYTES:
+            return True
+        return max(width, height) / min(width, height) > MAX_IMAGE_ASPECT
+
     def extract_visual_chunks(self, pdf_path: str, filename: str) -> list[Document]:
+        started = time.perf_counter()
+        stats = dict(tables=0, images=0, vision_calls=0, skipped_decorative=0,
+                     skipped_duplicate=0, skipped_cap=0, failed=0)
+        # 페이지 순서대로 만들 청크 목록: (GPT 호출 종류 "image"·"table" 또는 호출 없음 None, 입력, 메타데이터)
+        jobs = []
+        seen_xrefs, seen_hashes = set(), set()
         doc = fitz.open(pdf_path)
+        try:
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
+                page_num = page_idx  # 0-based page index
+
+                # 1. 표(Table) 추출
+                tabs = page.find_tables()
+                for t_idx, table in enumerate(tabs):
+                    df = table.to_pandas()
+                    if df.empty or df.shape[0] < 1:
+                        continue
+                    table_md = df.to_markdown(index=False)
+                    metadata = {
+                        "element_type": "table",
+                        "page": page_num,
+                        "source_filename": filename,
+                        "source": str(pdf_path),
+                        "table_index": t_idx,
+                        "raw_table_md": table_md,
+                    }
+                    stats["tables"] += 1
+                    jobs.append(("table" if SUMMARIZE_TABLES else None, table_md, metadata))
+
+                # 2. 이미지/차트(Image) 추출. 같은 이미지(xref·내용)가 여러 페이지에 반복되면 한 번만 (#74)
+                for img_idx, img_info in enumerate(page.get_images(full=True)):
+                    xref = img_info[0]
+                    if xref in seen_xrefs:
+                        stats["skipped_duplicate"] += 1
+                        continue
+                    seen_xrefs.add(xref)
+                    base_image = doc.extract_image(xref)
+                    if self._is_decorative(base_image):
+                        stats["skipped_decorative"] += 1
+                        continue
+                    digest = hashlib.sha1(base_image["image"]).hexdigest()
+                    if digest in seen_hashes:
+                        stats["skipped_duplicate"] += 1
+                        continue
+                    seen_hashes.add(digest)
+                    metadata = {
+                        "element_type": "image",
+                        "page": page_num,
+                        "source_filename": filename,
+                        "source": str(pdf_path),
+                        "image_index": img_idx,
+                        "image_xref": xref,
+                    }
+                    jobs.append(("image", (base_image["image"], base_image["ext"]), metadata))
+        finally:
+            doc.close()
+
+        # PDF당 호출 상한: 페이지 앞쪽부터 상한까지만 호출하고 나머지 이미지는 청크를 만들지 않음 (#74)
+        calls = 0
+        kept = []
+        for job in jobs:
+            if job[0] is not None:
+                if calls >= MAX_VISION_CALLS:
+                    if job[0] == "image":
+                        stats["skipped_cap"] += 1
+                        continue
+                    job = (None,) + job[1:]  # 상한을 넘은 표는 요약 없이 원문만 둠
+                else:
+                    calls += 1
+            kept.append(job)
+
+        # 호출은 몇 개씩 동시에 보내고, 결과는 원래 순서대로 모음. 하나가 실패해도 나머지는 등록 (#74, #65)
+        trace = request_log.current()   # 작업 스레드에는 요청 로그 컨텍스트가 넘어가지 않아 미리 잡아 둠
+        def run(job):
+            """(청크 내용, 실패 여부). 표는 요약이 실패해도 원문은 남기고, 이미지는 건너뜀"""
+            kind, payload, metadata = job
+            config = {"callbacks": [request_log.TokenUsageCallback(
+                trace, self.model_name, stage=f"{kind}_summary")]} if trace and kind else None
+            try:
+                if kind == "image":
+                    return f"[이미지/차트 분석]\n{self._summarize_image(*payload, config=config)}", False
+                if kind == "table":
+                    return f"[표 데이터 요약]\n{self._summarize_table(payload, config=config)}\n\n[원본 표]\n{payload}", False
+            except Exception as error:
+                logging.getLogger(__name__).warning("시각 요소 분석 실패(%s p.%s): %s",
+                                                    filename, metadata["page"] + 1, error)
+                return (None if kind == "image" else f"[원본 표]\n{payload}"), True
+            return f"[원본 표]\n{payload}", False
+
+        with ThreadPoolExecutor(max_workers=VISION_MAX_WORKERS) as pool:
+            results = list(pool.map(run, kept))
+
         visual_chunks: list[Document] = []
+        for (kind, _, metadata), (content, failed) in zip(kept, results):
+            stats["vision_calls"] += kind is not None
+            stats["failed"] += failed
+            if content is None:
+                continue
+            stats["images"] += metadata["element_type"] == "image"
+            visual_chunks.append(Document(page_content=content, metadata=metadata))
 
-        for page_idx in range(len(doc)):
-            page = doc[page_idx]
-            page_num = page_idx  # 0-based page index
-
-            # 1. 표(Table) 추출
-            tabs = page.find_tables()
-            for t_idx, table in enumerate(tabs):
-                df = table.to_pandas()
-                if df.empty or df.shape[0] < 1:
-                    continue
-
-                table_md = df.to_markdown(index=False)
-                table_summary = self._summarize_table(table_md)
-
-                visual_chunks.append(
-                    Document(
-                        page_content=f"[표 데이터 요약]\n{table_summary}\n\n[원본 표]\n{table_md}",
-                        metadata={
-                            "element_type": "table",
-                            "page": page_num,
-                            "source_filename": filename,
-                            "source": str(pdf_path),
-                            "table_index": t_idx,
-                            "raw_table_md": table_md,
-                        },
-                    )
-                )
-
-            # 2. 이미지/차트(Image) 추출
-            image_list = page.get_images(full=True)
-            for img_idx, img_info in enumerate(image_list):
-                xref = img_info[0]
-                base_image = doc.extract_image(xref)
-                if base_image["width"] < 120 or base_image["height"] < 120:
-                    continue
-
-                img_filename = f"page_{page_num + 1}_img_{img_idx}_{uuid.uuid4().hex[:6]}.{base_image['ext']}"
-                img_filepath = os.path.join(self.image_save_dir, img_filename)
-                with open(img_filepath, "wb") as f:
-                    f.write(base_image["image"])
-
-                img_summary = self._summarize_image(img_filepath)
-
-                visual_chunks.append(
-                    Document(
-                        page_content=f"[이미지/차트 분석]\n{img_summary}",
-                        metadata={
-                            "element_type": "image",
-                            "page": page_num,
-                            "source_filename": filename,
-                            "source": str(pdf_path),
-                            "image_path": img_filepath,
-                        },
-                    )
-                )
-
-        doc.close()
+        if trace:
+            trace.emit("visual_chunks", filename=filename, chunks=len(visual_chunks),
+                       seconds=round(time.perf_counter() - started, 4), **stats)
         return visual_chunks
 
 def _layout_page_texts(pdf_path, pages):
@@ -268,7 +328,9 @@ def _build_db(pdf_paths, openai_key, report_records=None, analyze_metadata=False
                 visual_chunks = []
                 if visual_chunker is not None:
                     try:
-                        visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
+                        # 시각 청킹 시간·호출 수·토큰을 요청 로그에 따로 남김 (#74)
+                        with request_log.stage("visual_chunking"):
+                            visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
                     except Exception as ve:
                         logging.getLogger(__name__).warning("시각 청크 추출 실패(%s): %s", filename, ve)
 
@@ -830,20 +892,41 @@ _sessions_guard = threading.Lock()
 # 2. 팀 로고 불러오기
 # ==========================================
 
+# 원본 hyundap_logo.png(1254×1254, 1.2MB)를 base64로 그대로 넣으면 HTML과 /config에
+# 두 번 실려 첫 로드가 약 3.4MB였음. 또 Hugging Face Spaces는 일반 git으로 push한
+# 바이너리 파일을 거부함 → 화면 표시 크기(27~36px)의 2배인 72×72로 줄이고 64색으로
+# 압축한 PNG(948 bytes)를 문자열로 코드에 직접 넣고, 이미지 파일은 저장소에서 뺌 (#60)
+LOGO_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEgAAABICAMAAABiM0N1AAAAwFBMVEX9/f0YlFQJjUgIRynK"
+    "19Hl7Ol+w6AYVDfP5NqGpZcAPBwyZ06Jyah1mYhXg26YsqY3o2tNe2W6zMTZ6+JouZBIqnci"
+    "mFuku7AkXEGz3MdCdFwrnWFjjHk+cFl5wZ1ZsoSvxLqj1bshWj674M6RrqBqkX8ALAqb0bYA"
+    "PyDe8Od/opIAhj5Tr4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAVEFlRAAAAQHRSTlP/////////////////////////////////"
+    "//////////////////////////8AAAAAAAAAAAAAAAAAAAAAAAAAFPfcwQAAAmNJREFUeNrt"
+    "lWt3oyAQhpGBghfiJcZbLk2aJm139///vh3QJpp6opGcPfvB94MI4iMD74yEzJo163/Rn/Q5"
+    "nJI68imgteNEz+Ck1HFoYM85Okb2wUU1aGXL2dEaZBucdC5aWoFWFw59teEE9LoiepjOWTpt"
+    "WZhpRdugcjLn0ObQj+kLytqcwC43LhxTAMrAIjdqjjH2VzbJTFELtP4eWdlZqE5ZUwYONhai"
+    "5ZWcWVioPrBje9cfWJDUMudGd2bg4oXjY+VVNuvKmmSNpmVKSpvp6+YmpZOsWTrfC5Hrrx9H"
+    "+ICZopsPl50qQEeb6YV26323mow3k+zY+cbjzgNmWt0U11d6Cxpnpg/aPZ/gB2fkby7rzi/7"
+    "OGPMlDpZO+uXfRh0x6CZDr/pVXjSEV56NRRcsAtergp2nW7rQTr9V/DvxdjgFM5GHDsXYjAZ"
+    "Q28xAvQmBufko0Diba9UQkIXQ2RuzhS2octzN9HDSNm4LixMi4+5m+83SvavCFCJOseExGfl"
+    "nhUhvsd8PQo52XgAAkELT/cr9onXT9Gzr7yAd65ggXvFuQAeei6CgMWg+C9YMPCZrGCT6DbG"
+    "vhB6etwXWoEhwRY/GYZeTNwGVMESh2PT3Xsn0yYGjC8JcQeE3/RhjyDVrEjWIKVP7fRu2gYk"
+    "9Ts9m12DyBb0pASKUOGNb0AVhuK6AjYSTBszgDisvFMPyPc1CIPOAUIcUOBBsSdbgSBRkVx4"
+    "4ONmh3XLoMCbuPf8ub5o20HBTclN2GUYLxy7y6aVHEPjyd1c4JXQ2zCYUGaz75Z+EBvyDBBh"
+    "/Fk5PmvWrKv+Aq3BHimNNcEpAAAAAElFTkSuQmCC"
+)
+
+
 def get_logo_html():
-    logo_path = Path(__file__).with_name("hyundap_logo.png")
-
-    if logo_path.exists():
-        encoded = base64.b64encode(
-            logo_path.read_bytes()
-        ).decode("utf-8")
-
+    if LOGO_PNG_BASE64:
         return (
             '<img class="team-logo" '
-            f'src="data:image/png;base64,{encoded}" '
+            f'src="data:image/png;base64,{LOGO_PNG_BASE64}" '
             'alt="hyundap 로고">'
         )
 
+    # 로고 데이터가 없으면 책 아이콘으로 대체
     return '<span class="logo-fallback">📚</span>'
 
 
@@ -938,10 +1021,26 @@ footer {
    상단 로고 + 제목
 ========================= */
 
+/* 제목 줄: 두 칸 너비를 Gradio 기본(flex: 1, 최소 210px+100px)이 아닌 실제 내용 폭으로 계산하고
+   줄바꿈을 허용 → 좁은 화면(320·375px)에서 제목과 토글이 한 줄에 안 들어가면
+   토글이 제목 아래 줄로 내려가 카드 밖으로 잘리지 않음 (#75) */
 #title-row {
     align-items: center !important;
-    flex-wrap: nowrap !important;
+    flex-wrap: wrap !important;
     gap: 8px !important;
+}
+
+#title-col {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+}
+
+#mode-col {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    margin-left: auto !important;
 }
 
 .brand-header {
@@ -981,6 +1080,8 @@ footer {
     border: none !important;
     padding: 0 !important;
     min-width: 0 !important;
+    width: auto !important;
+    overflow: visible !important;   /* 라벨 글자가 상자 밖에서 잘리지 않게 (#75) */
 }
 
 #mode-select label,
@@ -1152,11 +1253,13 @@ footer {
     background: var(--chat-bg) !important;
 }
 
-/* 사용자 말풍선 */
+/* 사용자 말풍선
+   흰 글자 대비가 #6478ed에서 3.85:1로 부족해 같은 계열의 더 진한 파랑으로 바꿈
+   → 5.00:1(WCAG AA 4.5:1 이상), 라이트·다크 공통 (#63) */
 
 #chat-box .message.user,
 #chat-box .message.user.message {
-    background: #6478ed !important;
+    background: #5064dc !important;
     color: #ffffff !important;
     border: none !important;
     border-radius: 16px !important;
@@ -1433,23 +1536,12 @@ footer {
     }
 }
 
-/* 320px: 제목 줄이 넘쳐 다크모드 토글이 카드 밖으로 잘리던 문제 */
+/* 320px: 제목 글자를 조금 줄이고, 그래도 넘치면 제목 안에서 줄바꿈
+   (토글 줄바꿈은 위 #title-row 규칙이 처리, #75) */
 @media (max-width: 360px) {
-    #title-row {
-        flex-wrap: wrap !important;
-    }
-
-    #title-row > * {
-        min-width: 0 !important;
-    }
-
     .page-title {
         white-space: normal;
         font-size: 15px;
-    }
-
-    #mode-select {
-        max-width: 100% !important;
     }
 }
 """
@@ -1584,6 +1676,21 @@ def register_library(report_ids, request: gr.Request):
         message += REGISTER_FAILED_NOTE
     return db, message, paths
 
+def lock_register():
+    # 클릭 즉시(queue=False) 등록·선택 버튼과 질문을 잠가 연타로 등록이 여러 번 실행되지 않게 함 (#62)
+    # DB 삭제처럼 시간이 걸리는 작업은 다음 단계(start_register)에서 처리
+    locked = gr.update(interactive=False)
+
+    return (
+        QUESTION_PROCESSING,
+        gr.update(interactive=False, placeholder=QUESTION_PROCESSING),
+        locked,                                                  # 질문하기
+        locked,                                                  # PDF 선택
+        locked,                                                  # 파일 등록
+        locked                                                   # 선택 초기화
+    )
+
+
 def start_register(request: gr.Request):
 
     with _session_lock(request):
@@ -1684,6 +1791,18 @@ def _start_registration_ui(request: gr.Request):
     return (*start_register(request), *(gr.update(interactive=False) for _ in range(4)))
 
 
+def _lock_registration_ui():
+    return (*lock_register(), *(gr.update(interactive=False) for _ in range(4)))
+
+
+def _start_answer_ui():
+    return (*start_answer(), *(gr.update(interactive=False) for _ in range(4)))
+
+
+def _finish_answer_ui(db):
+    return (*finish_answer(db), *(gr.update(interactive=True) for _ in range(4)))
+
+
 def _finish_registration_ui(db, message, pdf_paths):
     return (*finish_register(db, message, pdf_paths), *(gr.update(interactive=True) for _ in range(4)))
 
@@ -1691,6 +1810,44 @@ def _finish_registration_ui(db, message, pdf_paths):
 # ==========================================
 # 6. 질문 및 스트리밍 답변
 # ==========================================
+
+# 답변 생성 중에는 다음 질문·대화 초기화를 막아 순서 섞임·중복 요청·추가 비용을 방지 (#62, #61)
+QUESTION_ANSWERING = "⏳ 답변을 생성하는 중입니다. 완료되면 다음 질문을 할 수 있습니다."
+
+def start_answer():
+    # 질문 전송 즉시(queue=False) 질문창·질문하기와 DB/대화를 바꾸는 버튼을 잠금 (#62)
+    # 질문창은 value를 건드리지 않아야 다음 단계(ask_question)가 입력한 질문을 그대로 받음
+    locked = gr.update(interactive=False)
+
+    return (
+        gr.update(interactive=False, placeholder=QUESTION_ANSWERING),
+        locked,                                                  # 질문하기
+        locked,                                                  # PDF 선택
+        locked,                                                  # 파일 등록
+        locked,                                                  # 선택 초기화
+        locked,                                                  # 대화 초기화 (#61)
+        locked,                                                  # 이전 기록
+        locked                                                   # TXT 다운로드
+    )
+
+
+def finish_answer(db):
+    # 답변이 끝나면(오류로 끝나도) 등록된 DB가 있을 때만 질문을 다시 허용 (#62, #55)
+    can_ask = db is not None
+    placeholder = QUESTION_READY if can_ask else QUESTION_NO_PDF
+    unlocked = gr.update(interactive=True)
+
+    return (
+        gr.update(interactive=can_ask, placeholder=placeholder),
+        gr.update(interactive=can_ask),
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked
+    )
+
 
 def ask_question(question, history, db, request: gr.Request):
     with request_log.request(LOG_PATH, "qa", secrets=(OPENAI_API_KEY,), activate=False) as trace:
@@ -1702,14 +1859,20 @@ def _ask_question(question, history, db, request):
     history = list(history or [])
     prior_history = deepcopy(history)
 
+    # 입력 오류는 예외를 던지지 않고 안내만 함: 예외가 나면 뒤이은 잠금 해제(finish_answer)가 실행되지 않아
+    # 화면이 잠긴 채 남음 (#62). 빈 질문은 대화에 말풍선을 남기지 않음
     if not question or not question.strip():
         request_log.current().status = "error"
         request_log.current().emit("validation_failed", reason="empty_question")
-        history.append({
-            "role": "assistant",
-            "content": "⚠️ 질문을 입력해주세요."
-        })
-        yield history, ""
+        gr.Warning("질문을 입력해주세요.", title="안내")
+        yield prior_history, ""
+        return
+
+    if len(question.strip()) > MAX_QUESTION_LEN:
+        request_log.current().status = "error"
+        request_log.current().emit("validation_failed", reason="question_too_long")
+        gr.Warning(f"질문은 {MAX_QUESTION_LEN}자 이내로 입력하세요.", title="안내")
+        yield prior_history, question                   # 고쳐 쓸 수 있게 질문을 질문창에 되돌려 줌
         return
 
     history.append({
@@ -1754,8 +1917,11 @@ def _ask_question(question, history, db, request):
                     history[-1]["content"] = str(text)
                     yield history, ""
 
-        except gr.Error:
-            raise
+        except gr.Error as e:
+            # API 키·사용 한도·연결 오류 등도 대화에 안내하고 끝내야 잠금이 풀림 (#62)
+            request_log.current().status = "error"
+            history[-1]["content"] = f"⚠️ {e.message}"
+            yield history, ""
 
         except Exception as e:
             request_log.current().status = "error"
@@ -1958,7 +2124,8 @@ with gr.Blocks(
 
             with gr.Column(
                 scale=6,
-                min_width=210
+                min_width=210,
+                elem_id="title-col"
             ):
 
                 gr.HTML(f"""
@@ -1972,7 +2139,8 @@ with gr.Blocks(
 
             with gr.Column(
                 scale=1,
-                min_width=100
+                min_width=100,
+                elem_id="mode-col"
             ):
 
                 dark_mode = gr.Checkbox(
@@ -2155,6 +2323,11 @@ with gr.Blocks(
     library_search_btn.click(search_library, inputs=[library_query], outputs=[library_results, library_selection])
     library_query.submit(search_library, inputs=[library_query], outputs=[library_results, library_selection])
     library_register_btn.click(
+        _lock_registration_ui,
+        outputs=[status, question, send_btn, pdf_file, upload_btn, reset_select_btn,
+                 library_register_btn, library_selection, library_search_btn, library_query],
+        queue=False
+    ).then(
         _start_registration_ui,
         outputs=[db_state, status, question, send_btn, pdf_file, upload_btn, reset_select_btn,
                  library_register_btn, library_selection, library_search_btn, library_query]
@@ -2171,8 +2344,20 @@ with gr.Blocks(
         outputs=[selected_files, status]
     )
 
-    # PDF 처리 시작
+    # PDF 처리 시작: 즉시 잠금 → 이전 DB 정리 → 등록 → 결과·잠금 해제 (#62)
     upload_btn.click(
+        fn=_lock_registration_ui,
+        outputs=[
+            status,
+            question,
+            send_btn,
+            pdf_file,
+            upload_btn,
+            reset_select_btn,
+            library_register_btn, library_selection, library_search_btn, library_query
+        ],
+        queue=False
+    ).then(
         fn=_start_registration_ui,
         outputs=[
             db_state,
@@ -2203,33 +2388,42 @@ with gr.Blocks(
         ]
     )
 
-    # 질문하기
-    send_btn.click(
-        fn=ask_question,
-        inputs=[
-            question,
-            chatbot,
-            db_state
-        ],
-        outputs=[
-            chatbot,
-            question
-        ]
-    )
+    # 질문하기(➤) / Enter 전송: 잠금 → 스트리밍 답변 → 잠금 해제 (#62, #61)
+    # 잠금 해제는 .then이라 ask_question이 gr.Error로 끝나도 실행됨
+    answer_lock_outputs = [
+        question,
+        send_btn,
+        pdf_file,
+        upload_btn,
+        reset_select_btn,
+        clear_btn,
+        history_menu,
+        download_btn,
+        library_register_btn, library_selection, library_search_btn, library_query
+    ]
 
-    # Enter 전송
-    question.submit(
-        fn=ask_question,
-        inputs=[
-            question,
-            chatbot,
-            db_state
-        ],
-        outputs=[
-            chatbot,
-            question
-        ]
-    )
+    for trigger in (send_btn.click, question.submit):
+        trigger(
+            fn=_start_answer_ui,
+            outputs=answer_lock_outputs,
+            queue=False
+        ).then(
+            fn=ask_question,
+            inputs=[
+                question,
+                chatbot,
+                db_state
+            ],
+            outputs=[
+                chatbot,
+                question
+            ]
+        ).then(
+            fn=_finish_answer_ui,
+            inputs=[db_state],
+            outputs=answer_lock_outputs,
+            queue=False
+        )
 
     # 이전 대화 보관 및 초기화
     clear_btn.click(

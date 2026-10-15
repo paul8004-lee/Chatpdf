@@ -1,4 +1,7 @@
 """Run: .venv/Scripts/python.exe -m unittest test_app -v (no API calls)."""
+import base64
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +11,7 @@ from langchain_core.embeddings import Embeddings
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 import app
+import request_log
 
 
 class LocalEmbeddings(Embeddings):
@@ -176,6 +180,107 @@ class VisualChunkFallbackTest(unittest.TestCase):
             self.assertIn("1개 파일 · 2페이지 · 2개 청크", message)
             self.assertIn("vision failed", "\n".join(logs.output))
             db.delete_collection()
+
+
+def noise_png(width, height, seed):
+    """압축이 안 되는 무작위 픽셀 PNG (내용 있는 이미지 흉내)"""
+    import random
+    data = random.Random(seed).randbytes(width * height * 3)
+    return app.fitz.Pixmap(app.fitz.csRGB, width, height, data, False).tobytes("png")
+
+
+@unittest.skipIf(app.fitz is None, "pymupdf 필요")
+class VisualChunkBoundTest(unittest.TestCase):
+    """#74: 시각 청킹은 호출 상한·중복/장식 제외·병렬 호출, 이미지 파일을 남기지 않음 (API 호출 없음)"""
+
+    def write(self, folder, pages):
+        path = Path(folder) / "visual.pdf"
+        doc = app.fitz.open()
+        for images in pages:
+            page = doc.new_page(width=600, height=800)
+            for index, image in enumerate(images):
+                page.insert_image(app.fitz.Rect(10, 10 + index * 150, 210, 150 + index * 150), stream=image)
+        doc.save(path)
+        doc.close()
+        return path
+
+    def extract(self, path, side_effect=None):
+        chunker = app.VisualElementChunker(api_key="test")
+        labels = {}
+        def summarize(image_bytes, ext="png", config=None):
+            return labels.setdefault(image_bytes, f"img{len(labels)}")
+        with patch.object(chunker, "_summarize_image", side_effect=side_effect or summarize) as image, \
+             patch.object(chunker, "_summarize_table") as table:
+            chunks = chunker.extract_visual_chunks(str(path), "visual.pdf")
+        table.assert_not_called()
+        return chunks, image
+
+    def test_duplicate_and_decorative_images_are_skipped_without_files(self):
+        chart, other = noise_png(200, 200, 1), noise_png(200, 200, 2)
+        bar, icon = noise_png(1000, 120, 3), noise_png(60, 60, 4)
+        blank = app.fitz.Pixmap(app.fitz.csRGB, app.fitz.IRect(0, 0, 400, 400), False)
+        blank.clear_with(255)   # 크지만 단색인 배경 장식
+        blank = blank.tobytes("png")
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.write(folder, [[chart, bar, icon, blank], [chart, other]])
+            cwd = Path.cwd()
+            os.chdir(folder)
+            try:
+                chunks, image = self.extract(path)
+                leftovers = sorted(p.name for p in Path(folder).iterdir())
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(image.call_count, 2)   # chart 1번(2쪽 반복 제외) + other
+        self.assertEqual([c.metadata["page"] for c in chunks], [0, 1])
+        self.assertEqual(leftovers, ["visual.pdf"])   # extracted_images 폴더가 생기지 않음
+
+    def test_cap_keeps_page_order_and_failure_is_isolated(self):
+        images = [noise_png(200, 200, seed) for seed in range(5)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.write(folder, [[image] for image in images])
+            with patch.object(app, "MAX_VISION_CALLS", 3):
+                chunks, image = self.extract(path)
+            self.assertEqual(image.call_count, 3)
+            self.assertEqual([c.metadata["page"] for c in chunks], [0, 1, 2])
+
+            def flaky(image_bytes, ext="png", config=None):
+                if image_bytes == images[1]:
+                    raise RuntimeError("vision failed")
+                return "ok"
+            with self.assertLogs("app", level="WARNING") as logs:
+                chunks, _ = self.extract(path, side_effect=flaky)
+        self.assertEqual([c.metadata["page"] for c in chunks], [0, 2, 3, 4])
+        self.assertIn("vision failed", "\n".join(logs.output))
+
+    def test_counts_are_written_to_request_log(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.write(folder, [[noise_png(200, 200, 1)], [noise_png(200, 200, 1)]])
+            log = Path(folder) / "log.jsonl"
+            with request_log.request(log, "pdf_processing"):
+                self.extract(path)
+            events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        visual = next(e for e in events if e["event"] == "visual_chunks")
+        self.assertEqual((visual["vision_calls"], visual["images"], visual["skipped_duplicate"]), (1, 1, 1))
+        self.assertIn("seconds", visual)
+
+    def test_parallel_model_usage_is_counted_once_with_correct_stage(self):
+        from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+        from langchain_core.messages import AIMessage
+        model = FakeMessagesListChatModel(responses=[AIMessage(content="chart summary",
+            usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})])
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.write(folder, [[noise_png(200, 200, 1)], [noise_png(200, 200, 2)]])
+            log = Path(folder) / "log.jsonl"
+            with patch.object(app, "ChatOpenAI", return_value=model), \
+                 request_log.request(log, "pdf_processing") as trace:
+                chunks = app.VisualElementChunker("test").extract_visual_chunks(str(path), "visual.pdf")
+                self.assertEqual(trace.stage, "pdf_processing")
+            events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        usage = [e for e in events if e["event"] == "token_usage"]
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(usage), 2)
+        self.assertEqual({e["stage"] for e in usage}, {"image_summary"})
+        self.assertEqual(events[-1]["token_usage"]["total_tokens"], 20)
 
 
 class SourceFormatTest(unittest.TestCase):
@@ -357,6 +462,118 @@ class MultiDocumentTest(unittest.TestCase):
         self.assertIn("[b.pdf p.1]", context)
 
 
+def _event_chain(elem_id, event):
+    # demo 설정에서 트리거의 첫 이벤트와 .then으로 이어진 이벤트를 순서대로 찾음
+    config = app.demo.get_config_file()
+    ids = {c["props"].get("elem_id"): c["id"] for c in config["components"]}
+    deps = config["dependencies"]
+    fns = list(app.demo.fns.values())
+    first = [i for i, dep in enumerate(deps)
+             if [ids[elem_id], event] in [list(t) for t in dep["targets"]]]
+    chain = list(first[:1])
+    while chain:
+        nxt = [i for i, dep in enumerate(deps) if dep.get("trigger_after") == chain[-1]]
+        if not nxt:
+            break
+        chain.append(nxt[0])
+    return first, [deps[i] for i in chain], [fns[i].fn.__name__ for i in chain]
+
+
+class AnswerErrorPathTest(unittest.TestCase):
+    """#62: 질문 처리 중 오류가 나도 예외를 던지지 않아야 잠금 해제(finish_answer)가 실행됨"""
+
+    def run_ask(self, question, history=None, db=None):
+        request = Mock(session_hash="s62err")
+        with patch.object(app, "gr", wraps=app.gr) as gr_mock:
+            gr_mock.Warning = Mock()
+            outputs = list(app.ask_question(question, history or [], db, request))
+        return outputs, gr_mock.Warning
+
+    def test_empty_question_adds_no_bubble(self):
+        history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+        outputs, warning = self.run_ask("   ", history)
+        self.assertEqual(outputs[-1][0], history)
+        warning.assert_called_once()
+
+    def test_too_long_question_restores_text_without_raising(self):
+        long_question = "가" * (app.MAX_QUESTION_LEN + 5)
+        outputs, warning = self.run_ask(long_question)
+        self.assertEqual(outputs[-1], ([], long_question))
+        warning.assert_called_once()
+
+    def test_gr_error_from_answer_becomes_message(self):
+        request = Mock(session_hash="s62err")
+        db = Mock()
+        app._session_dbs[request.session_hash] = db
+        def failing_answer(*args, **kwargs):
+            raise app.gr.Error("API 키가 올바르지 않습니다.")
+            yield
+        try:
+            with patch.object(app, "answer", failing_answer):
+                outputs = list(app.ask_question("질문", [], db, request))
+        finally:
+            app._session_dbs.pop(request.session_hash, None)
+        self.assertEqual(outputs[-1][0][-1]["content"], "⚠️ API 키가 올바르지 않습니다.")
+
+
+class AnswerInProgressLockTest(unittest.TestCase):
+    """#62, #61: 답변 생성 중에는 다음 질문·대화 초기화를 할 수 없어야 함"""
+
+    def test_start_answer_locks_everything_without_clearing_question(self):
+        locked = app.start_answer()
+        self.assertEqual(len(locked), 8)
+        self.assertTrue(all(update["interactive"] is False for update in locked))
+        self.assertEqual(locked[0]["placeholder"], app.QUESTION_ANSWERING)
+        self.assertNotIn("value", locked[0])                    # 입력한 질문이 ask_question에 그대로 전달돼야 함
+
+    def test_finish_answer_with_db_reopens_question(self):
+        unlocked = app.finish_answer(Mock())
+        self.assertEqual(len(unlocked), 8)
+        self.assertTrue(all(update["interactive"] is True for update in unlocked))
+        self.assertEqual(unlocked[0]["placeholder"], app.QUESTION_READY)
+
+    def test_finish_answer_without_db_keeps_question_locked(self):
+        unlocked = app.finish_answer(None)
+        self.assertFalse(unlocked[0]["interactive"])
+        self.assertFalse(unlocked[1]["interactive"])
+        self.assertEqual(unlocked[0]["placeholder"], app.QUESTION_NO_PDF)
+        self.assertTrue(unlocked[0]["placeholder"].startswith("🔒"))
+        self.assertTrue(all(update["interactive"] is True for update in unlocked[2:]))  # 등록·초기화는 다시 가능
+
+    def test_both_triggers_use_lock_ask_unlock_chain(self):
+        for elem_id, event in (("send-btn", "click"), ("question-box", "submit")):
+            first, deps, names = _event_chain(elem_id, event)
+            self.assertEqual(len(first), 1)                     # 같은 트리거에 중복 등록 없음
+            self.assertEqual(names, ["_start_answer_ui", "ask_question", "_finish_answer_ui"])
+            self.assertFalse(deps[0]["queue"])                  # 잠금은 큐를 기다리지 않고 즉시 적용
+            self.assertFalse(deps[2]["queue"])
+            self.assertFalse(deps[2]["trigger_only_on_success"])  # 오류가 나도 잠금 해제
+
+    def test_clear_and_history_are_locked_outputs(self):
+        config = app.demo.get_config_file()
+        ids = {c["props"].get("elem_id"): c["id"] for c in config["components"]}
+        _, deps, _ = _event_chain("send-btn", "click")
+        for elem_id in ("question-box", "send-btn", "clear-btn", "history-menu", "upload-btn"):
+            self.assertIn(ids[elem_id], deps[0]["outputs"])
+            self.assertIn(ids[elem_id], deps[2]["outputs"])
+
+
+class RegisterImmediateLockTest(unittest.TestCase):
+    """#62: 파일 등록 클릭 즉시 버튼이 잠겨 연타로 여러 번 등록되지 않아야 함"""
+
+    def test_lock_register_locks_buttons_and_question(self):
+        locked = app.lock_register()
+        self.assertEqual(locked[0], app.QUESTION_PROCESSING)
+        self.assertEqual(locked[1]["placeholder"], app.QUESTION_PROCESSING)
+        self.assertTrue(all(update["interactive"] is False for update in locked[1:]))
+
+    def test_upload_chain_starts_with_unqueued_lock(self):
+        first, deps, names = _event_chain("upload-btn", "click")
+        self.assertEqual(len(first), 1)
+        self.assertEqual(names, ["_lock_registration_ui", "_start_registration_ui", "register_pdf", "_finish_registration_ui"])
+        self.assertFalse(deps[0]["queue"])
+
+
 class AnswerCacheTest(unittest.TestCase):
     """#24: 새 PDF DB에서 이전 PDF의 캐시 답변이 반환되면 안 됨"""
 
@@ -388,6 +605,25 @@ class AnswerCacheTest(unittest.TestCase):
         first.delete_collection.assert_called_once_with()
         self.assertIsNone(app._cache_get(first, "q"))
         self.assertEqual(app._cache_get(second, "q"), "B")
+
+
+class LogoTest(unittest.TestCase):
+    """로고가 수 KB짜리 인라인 PNG인지, 데이터가 없으면 📚로 대체되는지 확인 (#60)"""
+
+    def test_logo_is_small_inline_png(self):
+        html = app.get_logo_html()
+        self.assertIn('<img class="team-logo"', html)
+        self.assertIn("data:image/png;base64,", html)
+        png = base64.b64decode(app.LOGO_PNG_BASE64)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertLess(len(png), 4 * 1024)
+        self.assertLess(len(html), 4 * 1024)
+
+    def test_fallback_without_logo_data(self):
+        with patch.object(app, "LOGO_PNG_BASE64", ""):
+            self.assertEqual(
+                app.get_logo_html(), '<span class="logo-fallback">📚</span>'
+            )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,24 @@ from test_app import LocalEmbeddings, write_pdf
 
 
 class ReportLibraryTest(unittest.TestCase):
+    def test_library_controls_lock_for_answer_and_both_registration_paths(self):
+        config = app.demo.get_config_file()
+        library_ids = {c._id for c in (app.library_register_btn, app.library_selection,
+                                      app.library_search_btn, app.library_query)}
+        expected = {"_start_answer_ui", "_finish_answer_ui", "_lock_registration_ui",
+                    "_start_registration_ui", "_finish_registration_ui"}
+        observed = set()
+        for dependency in config["dependencies"]:
+            fn = app.demo.fns[dependency["id"]].fn
+            name = getattr(fn, "__name__", "")
+            if name in expected:
+                self.assertTrue(library_ids.issubset(dependency["outputs"]))
+                observed.add(name)
+        self.assertEqual(observed, expected)
+        self.assertTrue(all(u["interactive"] is False for u in app._start_answer_ui()))
+        self.assertTrue(all(u["interactive"] is True for u in app._finish_answer_ui(Mock())))
+        self.assertTrue(all(u["interactive"] is False for u in app._lock_registration_ui()[1:]))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
