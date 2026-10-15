@@ -2,7 +2,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from langchain_core.embeddings import Embeddings
 from pypdf import PdfWriter
@@ -35,6 +35,23 @@ def write_pdf(path, pages):
 
 
 class PDFWorkflowTest(unittest.TestCase):
+    def test_embedding_and_cleanup_failure_returns_status(self):
+        db = Mock()
+        db.add_documents.side_effect = RuntimeError("embedding failed")
+        db.delete_collection.side_effect = RuntimeError("cleanup failed")
+        with tempfile.TemporaryDirectory() as folder:
+            pdf_path = Path(folder) / "failed.pdf"
+            write_pdf(pdf_path, ["apple orchard"])
+            with patch.object(app, "OpenAIEmbeddings", return_value=LocalEmbeddings()), \
+                 patch.object(app, "Chroma", return_value=db), \
+                 self.assertLogs("app", level="ERROR") as logs:
+                result, message = app.build_db(str(pdf_path), "test")
+        self.assertIsNone(result)
+        self.assertIn("처리 실패", message)
+        self.assertIn("failed.pdf", message)
+        db.delete_collection.assert_called_once_with()
+        self.assertIn("cleanup failed", "\n".join(logs.output))
+
     def test_multiple_isolation_single_and_failure(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(
             app, "OpenAIEmbeddings", return_value=LocalEmbeddings()
