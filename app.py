@@ -96,6 +96,7 @@ def build_db(pdf_paths, openai_key):
 import json                      # 성능 기록을 JSON 형식(한 줄짜리 텍스트)으로 저장할 때 사용
 import re                        # 정규표현식: 파일 경로에서 파일 이름만 잘라낼 때 사용
 import time                      # 답변에 걸린 시간(초)을 잴 때 사용
+import weakref                   # DB 객체가 사라지는 순간을 감지해서 그 DB의 캐시를 지울 때 사용
 from datetime import datetime    # 성능 기록에 "언제 질문했는지" 날짜·시간을 남길 때 사용
 from pathlib import Path         # 파일 경로를 운영체제(Windows/Linux)에 상관없이 다루는 도구
 
@@ -116,7 +117,9 @@ MAX_HISTORY_TURNS = 3            # 후속 질문을 이해하려고 참고할 '�
 CACHE_SIZE = 100                 # 답변 캐시(임시 저장소)에 보관할 최대 질문 수
 LOG_PATH = Path("eval/qa_log.jsonl")  # 질문별 성능 기록을 저장할 파일 위치
 
-_answer_cache = {}               # 답변 캐시: {(PDF DB 번호, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
+_answer_cache = {}               # 답변 캐시: {(PDF 고유 이름, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
+_watched_db_keys = set()         # 사라지면 캐시를 지우도록 등록해 둔 DB 이름 목록 (중복 등록 방지)
+_dead_db_keys = set()            # 이미 사라진 DB 이름 목록. 다음 캐시 사용 때 그 DB의 캐시를 지움
 
 # ---------- 프롬프트 1: 멀티쿼리 (검색어 늘리기) ----------
 # 질문 하나로만 검색하면 표현이 조금만 달라도 관련 내용을 놓칠 수 있음.
@@ -196,16 +199,72 @@ def _rerank(llm, docs, query):
         return docs[:TOP_K]                                     #   답변은 계속되도록 원래 순서의 앞 TOP_K개를 사용
 
 
+def _db_key(db):
+    """[버그 수정] 캐시에서 PDF DB를 구분하는 고유 이름.
+    예전에는 id(db)(메모리 주소)를 썼는데, DB를 버리고 새 DB를 만들면
+    파이썬이 같은 주소를 다시 줄 수 있어서 이전 PDF의 답변이 나오는 문제가 있었음.
+    → Step 1이 업로드마다 새로 만드는 고유 컬렉션 이름(pdf_<uuid>)을 사용.
+    (db._collection은 DB 삭제 후 오류가 나므로, 삭제 후에도 남는 _collection_name을 씀)
+    """
+    return getattr(db, "_collection_name", None) or id(db)    # 이름이 없는 DB만 예전처럼 id 사용
+
+
+def _remove_cache_of(key):
+    """key(DB 이름)에 해당하는 캐시를 모두 지우고, 지운 개수를 돌려줌."""
+    old = [k for k in list(_answer_cache) if k[0] == key]        # 이 DB로 저장된 (DB 이름, 질문) 목록
+    for k in old:
+        _answer_cache.pop(k, None)                               # 하나씩 삭제 (이미 없으면 무시)
+    return len(old)
+
+
+def _purge_dead_caches():
+    """사라진 DB들의 캐시를 정리함. 캐시를 읽거나 쓰기 직전에 매번 호출."""
+    while _dead_db_keys:                                         # 정리할 DB가 남아 있는 동안
+        key = _dead_db_keys.pop()                                #   하나 꺼내서
+        _remove_cache_of(key)                                    #   그 DB의 캐시 삭제
+        _watched_db_keys.discard(key)                            #   감시 목록에서도 제거
+
+
+def _watch_db(db, key):
+    """DB 객체가 사라지면(새 PDF 등록으로 버려지는 경우 등) 그 DB 이름을 '정리 대상'에 넣도록 등록.
+    여기서 바로 지우지 않는 이유: 객체가 사라지는 시점은 예측할 수 없어서,
+    캐시를 사용하는 도중에 지우면 오류가 날 수 있음 → 다음 캐시 사용 때 안전하게 정리."""
+    if key in _watched_db_keys:                                  # 이미 등록했으면
+        return                                                   #   다시 등록하지 않음
+    try:
+        weakref.finalize(db, _dead_db_keys.add, key)             # db가 사라지는 순간 key를 정리 대상에 추가
+        _watched_db_keys.add(key)
+    except TypeError:                                            # 감시할 수 없는 객체면 (드묾)
+        pass                                                     #   자동 정리만 생략 (캐시 구분은 정상 동작)
+
+
 def _cache_get(db, query):
     """[업그레이드 2] 같은 PDF(db)에 같은 질문(query)을 한 적이 있으면 저장해 둔 답변을 꺼냄. 없으면 None."""
-    return _answer_cache.get((id(db), query))                   # id(db): 지금 올린 PDF 데이터베이스를 구분하는 고유 번호
+    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
+    return _answer_cache.get((_db_key(db), query))               # (PDF 고유 이름, 질문)으로 저장된 답변 찾기
 
 
 def _cache_put(db, query, text):
     """[업그레이드 2] 새로 만든 답변을 캐시에 저장함."""
-    if len(_answer_cache) >= CACHE_SIZE:                        # 캐시가 가득 찼으면
-        _answer_cache.pop(next(iter(_answer_cache)))            #   가장 먼저 저장된(가장 오래된) 답변 1개를 지움
-    _answer_cache[(id(db), query)] = text                       # (PDF 번호, 질문)을 열쇠로 답변을 저장
+    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
+    if len(_answer_cache) >= CACHE_SIZE:                         # 캐시가 가득 찼으면
+        _answer_cache.pop(next(iter(_answer_cache)))             #   가장 먼저 저장된(가장 오래된) 답변 1개를 지움
+    key = _db_key(db)                                            # 이 PDF의 고유 이름
+    _answer_cache[(key, query)] = text                           # (PDF 고유 이름, 질문)을 열쇠로 답변을 저장
+    _watch_db(db, key)                                           # 이 DB가 사라지면 캐시가 자동 정리되도록 등록
+
+
+def clear_answer_cache(db=None):
+    """[버그 수정 · 화면 팀 호출용] 캐시를 직접 정리함.
+    db를 주면 그 PDF의 캐시만, 안 주면 전체 캐시를 지움. 반환: 지운 개수.
+    DB를 직접 삭제할 때(old_db.delete_collection()) 그 전에 호출하면 됨.
+    """
+    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
+    if db is None:                                               # 전체 삭제
+        count = len(_answer_cache)
+        _answer_cache.clear()
+        return count
+    return _remove_cache_of(_db_key(db))                         # 이 PDF의 캐시만 삭제
 
 
 def _log(**record):
