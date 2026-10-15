@@ -245,6 +245,45 @@ class PageContextTest(unittest.TestCase):
         self.assertEqual([d.page_content for d in app._expand_to_pages(docs)], [big, "c2"])
 
 
+class QuestionLockMessageTest(unittest.TestCase):
+    """#55: 질문창이 막혀 있을 때 그 이유를 안내해야 함"""
+
+    def test_initial_question_box_explains_why_locked(self):
+        box = next(b for b in app.demo.blocks.values() if getattr(b, "elem_id", None) == "question-box")
+        self.assertFalse(box.interactive)
+        self.assertEqual(box.placeholder, app.QUESTION_NO_PDF)
+
+    def test_processing_and_result_placeholders(self):
+        request = Mock(session_hash="s55")
+        started = app.start_register(request)
+        self.assertEqual(started[2]["placeholder"], app.QUESTION_PROCESSING)
+        self.assertFalse(started[2]["interactive"])
+        failed = app.finish_register(None, "❌ 처리 실패")
+        self.assertEqual(failed[0], "❌ 처리 실패")              # 결과 문구와 잠금 상태가 함께 바뀜
+        self.assertEqual(failed[1]["placeholder"], app.QUESTION_NOT_REGISTERED)
+        self.assertFalse(failed[1]["interactive"])
+        self.assertFalse(failed[2]["interactive"])
+        ready = app.finish_register(Mock(), "✅ 처리 완료")
+        self.assertEqual(ready[0], "✅ 처리 완료")
+        self.assertEqual(ready[1]["placeholder"], app.QUESTION_READY)
+        self.assertTrue(ready[1]["interactive"])
+        self.assertTrue(ready[2]["interactive"])
+
+    def test_failed_registration_message_says_question_needs_pdf(self):
+        request = Mock(session_hash="s55")
+        with patch.object(app, "build_db", return_value=(None, "❌ 처리 실패: 등록할 수 있는 PDF가 없습니다.")):
+            db, message = app.register_pdf(["/tmp/x.pdf"], request)
+        self.assertIsNone(db)
+        self.assertIn("처리 실패", message)
+        self.assertIn("등록에 성공해야 질문할 수 있습니다", message)
+
+    def test_every_failure_path_explains_question_lock(self):
+        request = Mock(session_hash="s55")
+        self.assertIn("등록에 성공해야 질문할 수 있습니다", app.register_pdf(None, request)[1])
+        with patch.object(app, "OPENAI_API_KEY", None):
+            self.assertIn("등록에 성공해야 질문할 수 있습니다", app.register_pdf(["/tmp/x.pdf"], request)[1])
+
+
 class AnswerCacheTest(unittest.TestCase):
     """#24: 새 PDF DB에서 이전 PDF의 캐시 답변이 반환되면 안 됨"""
 
