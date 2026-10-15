@@ -496,6 +496,17 @@ footer {
     font-size: 12px !important;
 }
 
+#reset-select-btn {
+    align-self: flex-start !important;
+    width: auto !important;
+    min-width: 0 !important;
+    background: var(--field) !important;
+    color: var(--muted) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 9px !important;
+    box-shadow: none !important;
+}
+
 /* 질문 입력창 */
 
 #question-box {
@@ -641,30 +652,45 @@ def _delete_db(db):
 # 4. PDF 다중 업로드
 # ==========================================
 
-def select_pdf(files):
+def _selection_status(paths):
+    if not paths:
+        return "📁 선택한 PDF가 없습니다."
 
+    return (
+        f"✅ 총 {len(paths)}개 PDF 선택 완료\n\n"
+        + "\n".join(
+            f"- 📄 {Path(path).name}"
+            for path in paths
+        )
+        + "\n\n다시 선택하면 목록에 추가됩니다. 비우려면 '선택 초기화'를 누르세요."
+    )
+
+
+def select_pdf(files, current_paths=None):
+    # 다시 선택하면 기존 목록에 추가 (#41). 같은 이름의 파일은 새로 고른 것으로 교체
     if not files:
-        return None, "📎 PDF 파일을 선택해주세요."
+        return current_paths, _selection_status(current_paths)
 
     if not isinstance(files, list):
         files = [files]
 
-    paths = [
-        f if isinstance(f, str) else f.name
-        for f in files
-    ]
+    selected = {
+        Path(path).name: path
+        for path in (current_paths or [])
+    }
 
-    filenames = [Path(path).name for path in paths]
+    for f in files:
+        path = f if isinstance(f, str) else f.name
+        selected[Path(path).name] = path
 
-    status = (
-        f"✅ 총 {len(paths)}개 PDF 선택 완료\n\n"
-        + "\n".join(
-            f"- 📄 {name}"
-            for name in filenames
-        )
-    )
+    paths = list(selected.values())
 
-    return paths, status
+    return paths, _selection_status(paths)
+
+
+def clear_selection():
+    # 선택한 PDF 목록 비우기 (#41). 이미 등록된 DB는 그대로 두고 다음 등록 대상만 초기화
+    return None, _selection_status(None)
 
 
 def start_register(request: gr.Request):
@@ -679,6 +705,7 @@ def start_register(request: gr.Request):
     return (
         None,
         "⏳ PDF 처리 중입니다... 완료 후 질문할 수 있습니다.",
+        locked,
         locked,
         locked,
         locked,
@@ -714,6 +741,7 @@ def finish_register(db):
     return (
         can_ask,
         can_ask,
+        gr.update(interactive=True),
         gr.update(interactive=True),
         gr.update(interactive=True)
     )
@@ -856,6 +884,13 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             elem_id="upload-status"
         )
 
+        reset_select_btn = gr.Button(
+            "🧹 선택 초기화",
+            variant="secondary",
+            size="sm",
+            elem_id="reset-select-btn"
+        )
+
         # 질문
         gr.HTML(
             '<div class="section-label">💬 질문</div>'
@@ -904,7 +939,12 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
     pdf_file.upload(
         fn=select_pdf,
-        inputs=[pdf_file],
+        inputs=[pdf_file, selected_files],
+        outputs=[selected_files, status]
+    )
+
+    reset_select_btn.click(
+        fn=clear_selection,
         outputs=[selected_files, status]
     )
 
@@ -916,7 +956,8 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             question,
             ask_btn,
             pdf_file,
-            upload_btn
+            upload_btn,
+            reset_select_btn
         ]
     ).then(
         fn=register_pdf,
@@ -929,7 +970,8 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             question,
             ask_btn,
             pdf_file,
-            upload_btn
+            upload_btn,
+            reset_select_btn
         ]
     )
 
