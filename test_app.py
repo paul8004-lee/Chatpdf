@@ -149,6 +149,32 @@ class PartialFailureTest(unittest.TestCase):
         self.assertIn("API 키/연결", message)
 
 
+class SourceFormatTest(unittest.TestCase):
+    """#28: 출처는 원본 파일명(source_filename)과 실제 PDF 페이지(page + 1) 기준"""
+
+    def doc(self, **meta):
+        return Mock(metadata=meta, page_content="text")
+
+    def test_original_filename_and_real_page_win(self):
+        d = self.doc(source_filename="original.pdf", source="/tmp/renamed.pdf", page=0, page_label="iv")
+        self.assertEqual(app._page_label(d.metadata), "1")
+        self.assertIn("original.pdf (p.1)", app._format_sources([d]))
+        self.assertNotIn("renamed.pdf", app._format_sources([d]))
+        self.assertIn("[p.1]", app._format_docs([d]))
+
+    def test_fallbacks(self):
+        windows = self.doc(source=r"C:\data\report.pdf", page=4)
+        self.assertIn("report.pdf (p.5)", app._format_sources([windows]))
+        self.assertEqual(app._page_label({"page_label": "iv"}), "iv")
+        self.assertEqual(app._page_label({}), "?")
+        self.assertIn("문서 (p.?)", app._format_sources([self.doc()]))
+
+    def test_multiple_files_sorted_and_deduplicated(self):
+        docs = [self.doc(source_filename="a.pdf", page=9), self.doc(source_filename="b.pdf", page=0),
+                self.doc(source_filename="a.pdf", page=1), self.doc(source_filename="a.pdf", page=9)]
+        self.assertIn("a.pdf (p.2, 10) / b.pdf (p.1)", app._format_sources(docs))
+
+
 class AnswerCacheTest(unittest.TestCase):
     """#24: 새 PDF DB에서 이전 PDF의 캐시 답변이 반환되면 안 됨"""
 

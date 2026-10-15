@@ -143,12 +143,21 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def _page_label(meta):
-    """PDF 조각의 정보(meta)에서 사람이 보는 페이지 번호를 꺼냄."""
-    if meta.get("page_label"):              # PDF에 인쇄된 페이지 번호(예: 'iv', '12')가 있으면
-        return str(meta["page_label"])      #   그 번호를 그대로 사용
-    if isinstance(meta.get("page"), int):   # 없으면 컴퓨터식 페이지 번호(0부터 시작)를 확인해서
+    """PDF 조각의 정보(meta)에서 사람이 보는 페이지 번호를 꺼냄.
+    README 기준대로 실제 PDF 페이지 번호(page + 1)를 우선함 (#28). 인쇄된 라벨('iv' 등)은 page가 없을 때만 사용."""
+    if isinstance(meta.get("page"), int):   # 컴퓨터식 페이지 번호(0부터 시작)가 있으면
         return str(meta["page"] + 1)        #   사람식(1부터 시작)으로 바꾸려고 1을 더함
+    if meta.get("page_label"):              # 없으면 PDF에 인쇄된 페이지 번호(예: 'iv', '12')를 사용
+        return str(meta["page_label"])
     return "?"                              # 페이지 정보가 아예 없으면 물음표 표시
+
+
+def _source_name(meta):
+    """PDF 조각의 원본 파일 이름. build_db가 저장한 source_filename을 우선하고, 없으면 source 경로에서 꺼냄 (#28)."""
+    if meta.get("source_filename"):
+        return str(meta["source_filename"])
+    # 경로 'C:\data\report.pdf' 또는 '/tmp/report.pdf'에서 'report.pdf'만 꺼냄 (\ 와 / 모두 처리)
+    return re.split(r"[\\/]", meta.get("source", ""))[-1] or "문서"
 
 
 def _format_docs(docs):
@@ -163,8 +172,7 @@ def _format_sources(docs):
     """답변 아래에 붙일 '참고 페이지' 문구를 만듦. 예: '참고: report.pdf (p.2, 5, 7)'"""
     pages = {}                                                  # {파일이름: [페이지 목록]}을 담을 빈 상자
     for d in docs:                                              # 조각을 하나씩 보면서
-        # 경로 'C:\data\report.pdf' 또는 '/tmp/report.pdf'에서 'report.pdf'만 꺼냄 (\ 와 / 모두 처리)
-        name = re.split(r"[\\/]", d.metadata.get("source", ""))[-1] or "문서"
+        name = _source_name(d.metadata)                         # 원본 파일 이름 (예: report.pdf)
         label = _page_label(d.metadata)                         # 이 조각의 페이지 번호
         if label not in pages.setdefault(name, []):             # 같은 파일·같은 페이지가 이미 있으면 건너뜀 (중복 제거)
             pages[name].append(label)                           # 처음 나온 페이지만 목록에 추가
