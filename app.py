@@ -332,9 +332,10 @@ def _build_db(pdf_paths, openai_key):
 # Step 2에서 쓰는 import는 이 구역에 모아 둡니다. (다른 Step과 merge 충돌 방지)
 
 # ---------- 파이썬 기본 라이브러리 ----------
-import re                        # 정규표현식: 파일 경로에서 파일 이름만 잘라낼 때 사용
+import re                        # 정규표현식: 파일 경로에서 파일 이름 자르기, 문장 나누기, 질문 단어 뽑기에 사용
 import time                      # 답변에 걸린 시간(초)을 잴 때 사용
-from pathlib import Path         # 파일 경로를 운영체제(Windows/Linux)에 상관없이 다루는 도구
+import weakref                   # DB 객체가 사라지는 순간을 감지해서 그 DB의 캐시를 지울 때 사용
+from pathlib import Path        # 파일 경로를 운영체제(Windows/Linux)에 상관없이 다루는 도구
 
 # ---------- 외부 패키지 (requirements.txt로 설치됨) ----------
 import gradio as gr              # 웹 화면 라이브러리. 여기서는 gr.Error로 화면에 오류 메시지를 띄우는 데 사용
@@ -354,9 +355,23 @@ MAX_QUESTION_LEN = 500           # 질문 최대 글자 수 (너무 긴 질문�
 MAX_HISTORY_TURNS = 3            # 후속 질문을 이해하려고 참고할 '최근 대화' 개수 (질문+답변 한 쌍이 1개)
 CACHE_SIZE = 100                 # 답변 캐시(임시 저장소)에 보관할 최대 질문 수
 LOG_PATH = Path("eval/qa_log.jsonl")  # 질문별 성능 기록을 저장할 파일 위치
+EVIDENCE_MAX_ITEMS = 3           # [근거 원문] 답변 아래에 보여줄 최대 개수 (페이지 기준)
+EVIDENCE_MAX_CHARS = 150         # [근거 원문] 조각 1개당 최대 글자 수 (넘으면 '...'로 줄임)
+EVIDENCE_MAX_SENTENCES = 2       # [근거 원문] 조각 1개에서 뽑을 최대 문장 수
+
+# ---------- 검색 방식 설정 ----------
+# 이 값 하나만 바꾸면 검색 방식이 바뀜 (비교 실험: eval/compare_retrievers.py, 결과는 README)
+#   "similarity"        : 질문과 가장 비슷한 조각 TOP_K개
+#   "mmr"               : 비슷하면서도 내용이 겹치지 않는 조각 TOP_K개
+#   "multiquery"        : 질문을 3개로 바꿔 MMR로 각각 검색 (GPT 1회 추가)
+#   "multiquery_rerank" : multiquery + GPT가 순위 재정렬 (GPT 2회 추가, 기본값)
+SEARCH_MODES = ("similarity", "mmr", "multiquery", "multiquery_rerank")
+SEARCH_MODE = "multiquery_rerank"
 
 _answer_cache = {}               # 답변 캐시: {(PDF 컬렉션 이름, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
 _db_files_cache = {}             # DB별 등록 파일 이름 목록: {PDF 컬렉션 이름: [파일명, ...]}
+_watched_db_keys = set()         # 사라지면 캐시를 지우도록 등록해 둔 DB 이름 목록 (중복 등록 방지)
+_dead_db_keys = set()            # 이미 사라진 DB 이름 목록. 다음 캐시 사용 때 그 DB의 캐시를 지움
 
 # ---------- 프롬프트 1: 멀티쿼리 (검색어 늘리기) ----------
 # 질문 하나로만 검색하면 표현이 조금만 달라도 관련 내용을 놓칠 수 있음.
@@ -405,6 +420,17 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{question}"),                                                      # {question}에 사용자 질문이 들어감
 ])
 
+# ---------- [근거 원문]용 질문 단어 처리 ----------
+# 질문에서 '의미 없는 말'(조사, 질문 표현)을 빼고 핵심 단어만 남기려는 목록
+_STOPWORDS = {"무엇", "뭐", "얼마", "어떻게", "어떤", "알려줘", "알려주세요", "설명", "설명해줘",
+              "대해", "대한", "관련", "내용", "있나요", "인가요", "무엇인가요", "어디", "언제", "왜"}
+# '얼마인가요', '알려주세요', '무엇입니까'처럼 질문·요청 말투로 끝나는 덩어리는 핵심 단어가 아니므로 버림
+_QUESTION_TAIL = re.compile(r"^(얼마|무엇|뭐|어떻게|어떤|왜|언제|어디).*|.*(인가요|입니까|인지|나요|가요|까요|주세요|해줘|알려줘|말해줘)$")
+# 단어 끝에 붙는 조사. 긴 것부터 검사해야 '에서는'이 '는'보다 먼저 잘림
+_PARTICLES = sorted(["에서는", "으로는", "에서", "으로", "에는", "에게", "까지", "부터", "보다",
+                     "이라는", "라는", "은", "는", "이", "가", "을", "를", "의", "에", "로", "와", "과", "도", "만"],
+                    key=len, reverse=True)
+
 
 def _page_label(meta):
     """PDF 조각의 정보(meta)에서 사람이 보는 페이지 번호를 꺼냄.
@@ -421,7 +447,7 @@ def _source_name(meta):
     if meta.get("source_filename"):
         return str(meta["source_filename"])
     # 경로 'C:\data\report.pdf' 또는 '/tmp/report.pdf'에서 'report.pdf'만 꺼냄 (\ 와 / 모두 처리)
-    return re.split(r"[\\/]", meta.get("source", ""))[-1] or "문서"
+    return re.split(r"[\\/]", meta.get("source") or "")[-1] or "문서"
 
 
 def _format_docs(docs):
@@ -447,18 +473,170 @@ def _format_sources(docs):
     return "\n\n---\n**참고**: " + " / ".join(parts)              # 구분선(---) 아래에 굵은 글씨 '참고'로 표시
 
 
-def _rerank(llm, docs, query, top_n=TOP_K):
-    """[업그레이드 1] 검색된 조각들 중 질문과 가장 관련 있는 top_n개를 GPT가 골라 순서를 다시 매김."""
+def _keywords(question):
+    """질문에서 핵심 단어만 뽑음. 예: '2026년 경제성장률은 얼마인가요?' → ['2026년', '경제성장률']
+    조사를 떼고, 의미 없는 질문 표현(_STOPWORDS)은 버리고, 한 글자 단어와 중복은 제외."""
+    words = []                                                  # 뽑은 핵심 단어를 담을 목록
+    for w in re.findall(r"[0-9A-Za-z가-힣]+", question or ""):   # 한글·영문·숫자 덩어리를 하나씩 꺼냄
+        if w in _STOPWORDS or _QUESTION_TAIL.match(w):          # 의미 없는 질문 표현이면 건너뜀
+            continue
+        for p in _PARTICLES:                                    # 끝에 조사가 붙어 있으면
+            if w.endswith(p) and len(w) - len(p) >= 2:          #   떼어냄 (떼고 나서 2글자 이상 남을 때만)
+                w = w[: -len(p)]
+                break
+        if len(w) >= 2 and w not in _STOPWORDS and w.lower() not in words:  # 2글자 이상, 중복 아님
+            words.append(w.lower())                             # 영문은 대소문자 구분 없이 비교하려고 소문자로 저장
+    return words
+
+
+def _split_sentences(text):
+    """글을 문장 목록으로 나눔. 줄바꿈·연속 공백은 한 칸 공백으로 정리(글자는 고치지 않음).
+    '2.1%'처럼 마침표 뒤에 공백이 없는 숫자는 나누지 않고, '다. ' 처럼 마침표+공백에서 나눔.
+    보고서의 글머리 기호(○ ▪ ■ 등) 앞에서도 나눔."""
+    text = re.sub(r"\s+", " ", text or "").strip()              # 줄바꿈·탭·여러 칸 공백 → 공백 한 칸
+    parts = re.split(r"(?<=[.!?。])\s+|\s+(?=[○●▪■□◦•※])", text)  # 문장 끝 또는 글머리 기호 앞에서 자름
+    return [s.strip() for s in parts if s and s.strip()]        # 빈 조각 제거
+
+
+_EVIDENCE_SKIP = ("목 차", "목차", "비상업 목적", "인용 또는 전재", "문의는 아래")  # 근거로 보여주지 않을 머리말·안내문 표시
+
+
+def _is_toc_page(text):
+    """목차 페이지인지: 앞쪽 줄에 '목 차'가 있거나 '·····' 점선 줄이 여럿이면 목차로 봄."""
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return any(l.replace(" ", "") == "목차" for l in lines[:5]) or sum("·····" in l for l in lines) >= 2
+
+
+def _clean_page_lines(text, header_lines, page=None):
+    """페이지 글에서 반복 머리말(보고서 제목 줄)·쪽번호·'EXECUTIVE SUMMARY' 같은 줄을 빼고 돌려줌 (#76).
+    줄 단위로 거른 뒤에 문장으로 나눠야 '제목 24 ․ 본문'처럼 머리말이 문장 앞에 붙지 않음.
+    3쪽부터는 첫 줄이 짧고 문장으로 끝나지 않으면 보고서 제목 머리말로 보고 뺌."""
+    kept = []
+    first = True                                                # 페이지의 첫 글자 줄인지 (머리말 후보는 첫 줄 하나뿐)
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_first, first = first, False
+        if stripped in header_lines:
+            continue
+        if (is_first and isinstance(page, int) and page >= 2 and len(stripped) <= 80
+                and not stripped.endswith((".", "다", "음", "함", "임"))):
+            continue                                            # 각 쪽 맨 위 보고서 제목 줄
+        if re.fullmatch(r"[0-9ivxlcdmIVXLCDM]+", stripped):    # 쪽번호만 있는 줄 (1, 24, iii 등)
+            continue
+        if re.fullmatch(r"EXECUTIVE\s*SUMMARY", stripped, re.IGNORECASE):
+            continue
+        kept.append(stripped)
+    return "\n".join(kept)
+
+
+def _pick_evidence(text, keywords):
+    """글에서 질문 단어가 가장 많이 들어간 문장 1~2개를 골라 하나의 글로 돌려줌. 질문 단어가 든 문장이 없으면 ''."""
+    sentences = [s for s in _split_sentences(text)
+                 if not any(mark in s for mark in _EVIDENCE_SKIP)]  # 목차·저작권 안내 문장 제외 (#76)
+    if not sentences:                                           # 글이 비어 있으면
+        return ""                                               #   근거 없음
+    compact = [s.replace(" ", "").lower() for s in sentences]   # 띄어쓰기 차이('경제 성장률' vs '경제성장률')를 무시하려고 공백 제거본으로 비교
+    scores = [sum(k in c for k in keywords) for c in compact]   # 문장마다 '질문 단어가 몇 개 들어 있는지' 점수
+    ranked = sorted(range(len(sentences)), key=lambda i: (-scores[i], i))  # 점수 높은 순, 같으면 앞 문장 먼저
+    if scores[ranked[0]] == 0:                                  # 질문 단어가 든 문장이 하나도 없으면
+        return ""                                               #   엉뚱한 첫 문장을 근거로 보여주지 않음 (#76)
+    chosen = [ranked[0]]                                        # 1등 문장 선택
+    for i in ranked[1:EVIDENCE_MAX_SENTENCES]:                  # 다음 순위 문장들도 후보
+        if scores[i] > 0 and len(" ".join(sentences[j] for j in sorted(chosen + [i]))) <= EVIDENCE_MAX_CHARS:
+            chosen.append(i)                                    #   질문 단어가 있고, 합쳐도 글자 수 제한 안이면 추가
+    snippet = " ".join(sentences[i] for i in sorted(chosen))    # 원래 문서 순서대로 이어 붙임
+    if len(snippet) > EVIDENCE_MAX_CHARS:                       # 그래도 길면
+        snippet = snippet[:EVIDENCE_MAX_CHARS].rstrip() + "..."  #   150자에서 자르고 '...' 표시
+    return snippet
+
+
+def _escape_md(text):
+    """화면(마크다운)에서 *, _ 같은 문서 속 기호가 굵게/기울임으로 바뀌지 않도록 앞에 \\를 붙임. 보이는 글자는 그대로."""
+    return re.sub(r"([\\*_`~<>])", r"\\\1", text)
+
+
+def _is_refusal(answer_text):
+    """'문서에서 확인할 수 없습니다'만 답한 경우인지 (이때는 근거 원문을 붙이지 않음)."""
+    body = (answer_text or "").strip()
+    return body.startswith("문서에서 확인할 수 없습니다") and len(body) < 60
+
+
+def _format_evidence(docs, question, answer_text=""):
+    """[근거 원문] 답변 아래에 붙일 PDF 원문 발췌를 만듦. GPT 추가 호출 없음.
+    예)  **근거 원문**
+         > [보고서.pdf p.3] "2026년 경제성장률은 2.1%로 전망된다..."
+    - 조각(또는 페이지)마다 질문 단어가 가장 많이 든 문장 1~2개, 최대 150자
+    - 같은 파일·같은 페이지는 1번만, 최대 3개. 페이지 표시는 '참고'와 같은 _page_label 기준 (#28)
+    - 보여줄 근거가 하나도 없으면 빈 글자('')를 돌려줘서 칸 자체를 표시하지 않음"""
+    if _is_refusal(answer_text):                                # 답을 못 찾았다고 했으면 근거도 보여주지 않음 (#76)
+        return ""
+    # 질문 단어 + 답변 본문 단어로 문장을 고름: '각각'·비교 질문처럼 질문 단어가 일반적일 때도
+    # 답변이 실제로 말한 내용과 맞는 문장이 문서마다 골라지게 함 (#76)
+    keywords = _keywords(question)
+    # 답변 속 출처 표기([파일명 p.N])·숫자만 있는 단어는 문서 어디에나 있어 순위를 흐리므로 제외
+    answer_body = re.sub(r"[\[(][^\])]*p\.\s*\d+[^\])]*[\])]", " ", answer_text or "")
+    keywords += [k for k in _keywords(answer_body)
+                 if k not in keywords and not k.isdigit() and k != "pdf"][:20]
+    # 표·이미지 설명(시각 청크)의 마크다운 표·'###' 요약은 근거 문장으로 쓰지 않음 (#76).
+    # 페이지 원문(page_text)이 있으면 그 페이지의 원문 문장에서 고르고, 없으면 제외
+    docs = [d for d in docs if not d.metadata.get("element_type") or d.metadata.get("page_text")]
+    # 여러 페이지 첫 줄에 반복되는 보고서 제목은 머리말로 보고 뺌
+    first_lines = [((d.metadata.get("page_text") or d.page_content or "").strip().splitlines() or [""])[0].strip()
+                   for d in docs]
+    header_lines = {line for line in first_lines if line and first_lines.count(line) >= 2}
+    # 여러 PDF면 파일마다 한 번씩 번갈아 고르도록 순서를 바꿈 (한 문서에 근거가 몰리는 것 방지, #59)
+    by_file = {}
+    for d in docs:
+        by_file.setdefault(_source_name(d.metadata), []).append(d)
+    ordered = [d for group in zip(*by_file.values()) for d in group] if len(by_file) > 1 else docs
+    ordered += [d for d in docs if d not in ordered]
+    seen = set()                                                # 이미 보여준 (파일, 페이지) 기록
+    lines = []                                                  # 화면에 보여줄 줄 목록
+    for d in ordered:                                           # 검색된 조각을 (관련도 순서대로) 하나씩 보면서
+        name = _source_name(d.metadata)                         # 원본 파일명
+        page = _page_label(d.metadata)                          # 실제 PDF 페이지 (뷰어 번호와 동일)
+        if page != "?" and (name, page) in seen:                # 같은 페이지는 이미 보여줬으면 건너뜀
+            continue
+        # 조각 경계에서 문장이 잘리지 않게 페이지 전체(#37 page_text)에서 문장을 고름. 목차 페이지는 건너뜀
+        raw = d.metadata.get("page_text") or d.page_content
+        if _is_toc_page(raw):
+            continue
+        text = _clean_page_lines(raw, header_lines, d.metadata.get("page"))
+        snippet = _pick_evidence(text, keywords)                # 이 페이지에서 근거 문장 고르기
+        if not snippet:                                         # 고를 글이 없으면 건너뜀
+            continue
+        seen.add((name, page))
+        lines.append(f'> [{_escape_md(name)} p.{page}] "{_escape_md(snippet)}"')  # 예: > [보고서.pdf p.3] "..."
+        if len(lines) >= EVIDENCE_MAX_ITEMS:                    # 최대 3개까지만
+            break
+    if not lines:                                               # 보여줄 근거가 없으면
+        return ""                                               #   '근거 원문' 제목도 표시하지 않음
+    return "\n\n**근거 원문**\n" + "\n>\n".join(lines)           # 항목 사이는 빈 인용줄(>)로 띄워서 따로 보이게 함
+
+
+def _rerank_checked(llm, docs, query, top_n=TOP_K):
+    """[업그레이드 1] 검색된 조각들 중 질문과 가장 관련 있는 top_n개를 GPT가 골라 순서를 다시 매김.
+    반환: (조각 목록, 재정렬 성공 여부). 실패하면 원래 순서의 앞 top_n개와 False (#49 rerank_fallback 기록)."""
     if len(docs) <= top_n:                                      # 조각이 이미 top_n개 이하면 고를 필요가 없으니
-        return docs                                             #   그대로 돌려줌 (API 호출 절약)
+        return docs, True                                       #   그대로 돌려줌 (API 호출 절약)
     try:
         with request_log.stage("rerank"):
             reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=top_n)
-            return list(reranker.compress_documents(docs, query)) or docs[:top_n]
+            ranked = list(reranker.compress_documents(docs, query))
     except Exception:                                           # 재정렬 중 어떤 오류가 나도
-        if request_log.current():
-            request_log.current().emit("rerank_fallback", status="fallback")
-        return docs[:top_n]                                     #   답변은 계속되도록 원래 순서의 앞 top_n개를 사용
+        ranked = []                                             #   아래에서 실패로 처리
+    if ranked:
+        return ranked, True
+    if request_log.current():                                   # 오류이거나 결과가 비었으면
+        request_log.current().emit("rerank_fallback", status="fallback")
+    return docs[:top_n], False                                  #   답변은 계속되도록 원래 순서의 앞 top_n개를 사용
+
+
+def _rerank(llm, docs, query, top_n=TOP_K):
+    """재정렬된 조각 목록만 돌려줌 (성공 여부가 필요하면 _rerank_checked 사용)."""
+    return _rerank_checked(llm, docs, query, top_n)[0]
 
 
 def _db_files(db):
@@ -494,13 +672,14 @@ def _add_file_candidates(db, docs, query, files):
     return candidates
 
 
-def _cover_files(ranked, candidates, files):
-    """[#59] 재정렬 상위 TOP_K개에 없는 파일이 있으면, 그 파일에서 가장 순위가 높은 조각을 1개씩 보충함.
+def _cover_files(ranked, candidates, files, k=None):
+    """[#59] 재정렬 상위 k개(기본 TOP_K)에 없는 파일이 있으면, 그 파일에서 가장 순위가 높은 조각을 1개씩 보충함.
     한 문서만 근거로 쓰여 '각각'·'비교' 질문에서 다른 문서가 빠지는 문제를 막음."""
+    k = k or TOP_K
     ordered = list(ranked) + [d for d in candidates if d not in ranked]
-    picked = list(ranked[:TOP_K])
+    picked = list(ranked[:k])
     covered = {_source_name(d.metadata) for d in picked}
-    for doc in ordered[TOP_K:]:
+    for doc in ordered[k:]:
         name = _source_name(doc.metadata)
         if name in files and name not in covered:
             picked.append(doc)
@@ -508,29 +687,112 @@ def _cover_files(ranked, candidates, files):
     return picked
 
 
+def _retrieve(db, llm, query, mode=None, k=None):
+    """[검색 방식 선택] SEARCH_MODE에 맞는 방식으로 PDF 조각을 찾음.
+    반환: (조각 목록, 재정렬 성공 여부). 재정렬을 안 하는 방식이면 None.
+    answer()와 비교 실험 스크립트(eval/compare_retrievers.py)가 같이 씀.
+    여러 PDF가 등록돼 있으면 방식과 관계없이 파일별 후보 추가·빠진 파일 보충을 함 (#59)."""
+    mode = mode or SEARCH_MODE
+    k = k or TOP_K
+    if mode not in SEARCH_MODES:
+        raise ValueError(f"알 수 없는 검색 방식: {mode} (가능: {SEARCH_MODES})")
+
+    # 1) 기본 검색기: similarity는 가장 비슷한 k개, 나머지는 MMR(후보 k×5개 중 서로 겹치지 않게 k개)
+    if mode == "similarity":
+        retriever = db.as_retriever(search_kwargs={"k": k})
+    else:
+        retriever = db.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": k * 5})
+    if mode.startswith("multiquery"):                           # 2) 멀티쿼리: 질문을 3개로 바꿔 원래 질문까지 총 4번 검색
+        retriever = MultiQueryRetriever.from_llm(
+            retriever=retriever,                                # 실제 검색은 위의 MMR 검색기가 담당
+            llm=llm,                                            # 질문 3개를 만드는 데 GPT 사용
+            prompt=MULTI_QUERY_PROMPT,                          # 한국어 질문을 만들도록 직접 만든 프롬프트 사용
+            include_original=True,                              # 바꾼 질문 3개 + 원래 질문까지 총 4번 검색
+        )
+    trace = request_log.current()
+    try:
+        with request_log.stage("retrieval"):
+            # 재정렬할 방식은 후보 k×2개, 아니면 k개 (중복은 MultiQueryRetriever가 자동 제거)
+            docs = retriever.invoke(query)[: k * 2 if mode == "multiquery_rerank" else k]
+            _log_documents(db, docs)
+    finally:
+        if trace:
+            trace.usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
+                        stage="retrieval_embeddings")
+
+    rerank = mode == "multiquery_rerank"
+    files = _db_files(db)
+    if len(files) > 1:                                          # [#59] 여러 PDF: 파일별 후보 추가 → 전체 순위 → 빠진 파일 보충
+        candidates = _add_file_candidates(db, docs, query, files)
+        ranked, ok = candidates, None
+        if rerank:
+            # top_n을 후보 수보다 작게 해야 실제로 재정렬됨 (같거나 크면 재정렬을 건너뜀)
+            ranked, ok = _rerank_checked(llm, candidates, query, top_n=k + len(files))
+        return _cover_files(ranked, candidates, files, k), ok
+    if rerank:
+        return _rerank_checked(llm, docs, query, top_n=k)       # [업그레이드 1] k×2개 중 가장 관련 있는 k개로 추림
+    return docs, None
+
+
 def _cache_key(db):
     """캐시에서 PDF DB를 구분하는 열쇠. id(db)는 DB 해제 후 재사용될 수 있어 컬렉션 이름(UUID)을 사용함 (#24)"""
     return getattr(db, "_collection_name", None) or id(db)       # build_db가 만든 컬렉션 이름: pdf_<uuid>
 
 
+def _remove_cache_of(key):
+    """key(DB 컬렉션 이름)로 저장된 답변·등록 파일 목록 캐시를 지우고, 지운 답변 개수를 돌려줌."""
+    old = [k for k in list(_answer_cache) if k[0] == key]       # 이 DB로 저장된 (DB 이름, 질문) 목록
+    for cache_key in old:
+        _answer_cache.pop(cache_key, None)                      # 하나씩 삭제 (이미 없으면 무시)
+    _db_files_cache.pop(key, None)                              # 등록 파일 목록 캐시도 정리 (#59)
+    return len(old)
+
+
+def _purge_dead_caches():
+    """사라진 DB들의 캐시를 정리함. 캐시를 읽거나 쓰기 직전에 매번 호출."""
+    while _dead_db_keys:                                        # 정리할 DB가 남아 있는 동안
+        key = _dead_db_keys.pop()                               #   하나 꺼내서
+        _remove_cache_of(key)                                   #   그 DB의 캐시 삭제
+        _watched_db_keys.discard(key)                           #   감시 목록에서도 제거
+
+
+def _watch_db(db, key):
+    """DB 객체가 사라지면(새 PDF 등록으로 버려지는 경우 등) 그 DB 이름을 '정리 대상'에 넣도록 등록.
+    객체가 사라지는 시점은 예측할 수 없어서 여기서 바로 지우지 않고, 다음 캐시 사용 때 안전하게 정리함."""
+    if key in _watched_db_keys:                                 # 이미 등록했으면 다시 등록하지 않음
+        return
+    try:
+        weakref.finalize(db, _dead_db_keys.add, key)            # db가 사라지는 순간 key를 정리 대상에 추가
+        _watched_db_keys.add(key)
+    except TypeError:                                           # 감시할 수 없는 객체면 (드묾)
+        pass                                                    #   자동 정리만 생략 (캐시 구분은 정상 동작)
+
+
 def _cache_get(db, query):
     """[업그레이드 2] 같은 PDF(db)에 같은 질문(query)을 한 적이 있으면 저장해 둔 답변을 꺼냄. 없으면 None."""
+    _purge_dead_caches()                                        # 사라진 DB의 캐시부터 정리
     return _answer_cache.get((_cache_key(db), query))
 
 
 def _cache_put(db, query, text):
     """[업그레이드 2] 새로 만든 답변을 캐시에 저장함."""
+    _purge_dead_caches()                                        # 사라진 DB의 캐시부터 정리
     if len(_answer_cache) >= CACHE_SIZE:                        # 캐시가 가득 찼으면
         _answer_cache.pop(next(iter(_answer_cache)))            #   가장 먼저 저장된(가장 오래된) 답변 1개를 지움
-    _answer_cache[(_cache_key(db), query)] = text               # (PDF 컬렉션 이름, 질문)을 열쇠로 답변을 저장
-
-
-def _cache_clear(db):
-    """DB를 삭제·교체할 때 그 DB로 만든 답변을 캐시에서 지움 (#24)"""
     key = _cache_key(db)
-    for cache_key in [k for k in list(_answer_cache) if k[0] == key]:
-        _answer_cache.pop(cache_key, None)
-    _db_files_cache.pop(key, None)                              # 등록 파일 목록 캐시도 정리 (#59)
+    _answer_cache[(key, query)] = text                          # (PDF 컬렉션 이름, 질문)을 열쇠로 답변을 저장
+    _watch_db(db, key)                                          # 이 DB가 사라지면 캐시가 자동 정리되도록 등록
+
+
+def _cache_clear(db=None):
+    """DB를 삭제·교체할 때 그 DB로 만든 답변을 캐시에서 지움 (#24). db를 안 주면 전체 삭제. 반환: 지운 답변 개수."""
+    _purge_dead_caches()
+    if db is None:
+        count = len(_answer_cache)
+        _answer_cache.clear()
+        _db_files_cache.clear()
+        return count
+    return _remove_cache_of(_cache_key(db))
 
 
 def _log(**record):
@@ -581,6 +843,7 @@ def _history_to_text(history):
             content = item.get("content", "")                   # 실제 대화 내용
             if isinstance(content, list):                       # 이미지 등이 섞인 형식이면 (내용이 목록으로 옴)
                 content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))  # 글자 부분만 이어 붙임
+            content = str(content).split("\n\n---\n")[0]       # 답변 아래 '참고'·'근거 원문'은 빼고 본문만 (#76: 후속 질문 재작성 방해)
             lines.append(f"{role}: {content}")                  # 예: "사용자: 성장률은?"
         elif isinstance(item, (list, tuple)) and len(item) == 2:  # 예전 Gradio 형식: [질문, 답변]
             lines.append(f"사용자: {item[0]}")                   # 첫 번째는 사용자 질문
@@ -635,38 +898,17 @@ def _answer(question, openai_key, db, history=None):
         if cached:                                              # 있으면
             trace.status = "cached"
             _log(question=question, search_question=search_question, cached=True,  # 캐시로 답했다고 기록
+                 mode=SEARCH_MODE,
                  seconds=round(time.perf_counter() - start, 2))  # 걸린 시간(초, 소수점 둘째 자리까지)
             yield cached                                        # 저장된 답변을 바로 화면에 보여주고
             return                                              # 함수 끝 (검색·GPT 호출 생략 → 빠르고 비용 0)
 
-        # ===== 4단계: PDF에서 관련 내용 검색 =====
-        base_retriever = db.as_retriever(                       # 벡터 DB를 '검색기'로 변환
-            search_type="mmr",                                  # MMR: 비슷한 내용만 몰리지 않게 다양한 조각을 고르는 방식
-            search_kwargs={"k": TOP_K, "fetch_k": TOP_K * 5}    # 후보 20개를 먼저 찾고 그중 다양하게 4개 선택
-        )
-        retriever = MultiQueryRetriever.from_llm(               # 멀티쿼리 검색기: 질문을 3개로 바꿔 각각 검색
-            retriever=base_retriever,                           # 실제 검색은 위의 MMR 검색기가 담당
-            llm=llm,                                            # 질문 3개를 만드는 데 GPT 사용
-            prompt=MULTI_QUERY_PROMPT,                          # 한국어 질문을 만들도록 직접 만든 프롬프트 사용
-            include_original=True,                              # 바꾼 질문 3개 + 원래 질문까지 총 4번 검색
-        )
-        try:
-            with request_log.stage("retrieval"):
-                docs = retriever.invoke(search_question)[: TOP_K * 2]
-                _log_documents(db, docs)
-        finally:
-            trace.usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
-                        stage="retrieval_embeddings")
-        files = _db_files(db)
-        if len(files) > 1:                                      # [#59] 여러 PDF: 파일별 후보 추가 → 전체 순위 → 빠진 파일 보충
-            candidates = _add_file_candidates(db, docs, search_question, files)
-            # top_n을 후보 수보다 작게 해야 실제로 재정렬됨 (같거나 크면 _rerank가 재정렬을 건너뜀)
-            ranked = _rerank(llm, candidates, search_question, top_n=TOP_K + len(files))
-            docs = _cover_files(ranked, candidates, files)
-        else:
-            docs = _rerank(llm, docs, search_question)          # [업그레이드 1] 8개 중 가장 관련 있는 4개로 추림
+        # ===== 4단계: PDF에서 관련 내용 검색 (방식은 SEARCH_MODE 설정을 따름) =====
+        # 검색(retrieval) → [#59] 여러 PDF면 파일별 후보 추가 → [업그레이드 1] 재정렬 → 빠진 파일 보충
+        docs, rerank_ok = _retrieve(db, llm, search_question)
         with request_log.stage("selected_context"):
             _log_documents(db, docs)
+        selected = docs                                         # 페이지로 넓히기 전 조각 (근거 원문용)
         with request_log.stage("page_context"):                 # [#37] 고른 조각을 페이지 전체로 넓힘
             docs = _expand_to_pages(docs)
             if trace:
@@ -688,13 +930,20 @@ def _answer(question, openai_key, db, history=None):
                 text += chunk
                 yield text
 
-        # ===== 6단계: 참고 페이지 붙이기 =====
-        final = text + _format_sources(docs)                    # 완성된 답변 아래에 '참고: report.pdf (p.2, 5)' 추가
+        # ===== 6단계: 참고 페이지 + 근거 원문 붙이기 =====
+        # 근거 원문은 페이지 전체가 아니라 검색이 고른 조각(selected)에서 뽑음 → 질문과 맞는 문장이 더 정확히 나옴
+        # (글자 수 상한으로 GPT에 못 넘긴 페이지의 조각은 제외 → '참고' 페이지와 항상 일치)
+        sent = {(_source_name(d.metadata), d.metadata.get("page")) for d in docs}
+        evidence_docs = [d for d in selected if (_source_name(d.metadata), d.metadata.get("page")) in sent]
+        sources = "" if _is_refusal(text) else _format_sources(docs)  # 답을 못 찾았으면 '참고'도 붙이지 않음 (#76)
+        final = (text + sources                                 # 완성된 답변 아래에 '참고: report.pdf (p.2, 5)' 추가
+                 + _format_evidence(evidence_docs, search_question, text))  # 그 아래에 '근거 원문' 추가 (근거가 없으면 빈 글자)
         yield final                                             # 최종 답변을 화면에 표시
 
         # ===== 7단계: [업그레이드 2, 3] 캐시 저장 + 성능 기록 =====
-        _cache_put(db, search_question, final)                  # 다음에 같은 질문이 오면 바로 답하도록 저장
+        _cache_put(db, search_question, final)                  # 다음에 같은 질문이 오면 바로 답하도록 저장 (근거 원문 포함)
         _log(question=question, search_question=search_question, cached=False,  # 새로 답변했다고 기록
+             mode=SEARCH_MODE, rerank_ok=rerank_ok,             # 검색 방식, 재정렬 성공 여부 (재정렬을 안 하는 방식이면 None)
              seconds=round(time.perf_counter() - start, 2),     # 전체 걸린 시간(초)
              pages=[_page_label(d.metadata) for d in docs])     # 답변 근거로 쓴 페이지 목록
 
@@ -1859,6 +2108,8 @@ def create_chat_txt(history):
         content = _message_text(
             message.get("content", "")
         )
+        # 화면 표시용으로 붙인 마크다운 \ 이스케이프(근거 원문의 \_ \~ 등)는 TXT에서 원래 글자로 되돌림 (#76)
+        content = re.sub(r"\\([\\*_`~<>])", r"\1", content)
 
         lines.append(
             "[질문]" if role == "user"
