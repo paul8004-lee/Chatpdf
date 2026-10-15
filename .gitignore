@@ -9,6 +9,9 @@ venv/
 .gradio/
 chroma_db/
 eval/qa_log.jsonl
+library/*.sqlite3*
+eval/results_issue73*.jsonl
+extracted_images/
 # 문서 원본 (출처는 docs/sources.md에 기록)
 *.pdf
 # macOS
