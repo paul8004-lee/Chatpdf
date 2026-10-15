@@ -9,9 +9,126 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 import request_log
+import base64
+import pymupdf as fitz
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 
 NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
 
+# ==========================================
+# 표 / 이미지 전담 청킹 클래스 정의
+# ==========================================
+class VisualElementChunker:
+    """PDF 내에서 일반 텍스트는 건너뛰고, '표(Table)'와 '이미지/차트(Image)'만 전담으로 추출 및 요약 청킹"""
+
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "gpt-4o-mini",
+        image_save_dir: str = "./extracted_images",
+    ):
+        self.llm = ChatOpenAI(model=model_name, temperature=0.0, api_key=api_key)
+        self.image_save_dir = image_save_dir
+        os.makedirs(self.image_save_dir, exist_ok=True)
+
+    def _summarize_image(self, image_path: str) -> str:
+        with open(image_path, "rb") as f:
+            b64_image = base64.b64encode(f.read()).decode("utf-8")
+
+        prompt = """
+        당신은 데이터 시각화 및 문서 분석 전문가입니다.
+        제공된 이미지(차트, 그래프, 다이어그램 등)를 면밀히 분석하여 핵심 정보를 기술하세요.
+        - 차트/그래프 종류 (예: 꺾은선, 막대, 파이차트 등)
+        - 축 레이블, 범례, 주요 수치 데이터 및 증감 트렌드
+        - 이미지가 전달하고자 하는 핵심 결론
+        사용자가 자연어로 질문했을 때 벡터 검색에 잘 걸리도록 핵심 키워드와 숫자를 포함해 요약하세요.
+        """
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+                },
+            ]
+        )
+        response = self.llm.invoke([message])
+        return response.content
+
+    def _summarize_table(self, table_markdown: str) -> str:
+        prompt = f"""
+        다음 표의 구조와 수치 데이터를 분석하여 핵심 요약문을 작성하세요.
+        사용자가 자연어로 검색할 때 이 표가 잘 검색될 수 있도록 주요 항목명, 수치, 결론을 포함하세요.
+
+        [표 데이터]
+        {table_markdown}
+        """
+        response = self.llm.invoke(prompt)
+        return response.content
+
+    def extract_visual_chunks(self, pdf_path: str, filename: str) -> list[Document]:
+        doc = fitz.open(pdf_path)
+        visual_chunks: list[Document] = []
+
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            page_num = page_idx  # 0-based page index
+
+            # 1. 표(Table) 추출
+            tabs = page.find_tables()
+            for t_idx, table in enumerate(tabs):
+                df = table.to_pandas()
+                if df.empty or df.shape[0] < 1:
+                    continue
+
+                table_md = df.to_markdown(index=False)
+                table_summary = self._summarize_table(table_md)
+
+                visual_chunks.append(
+                    Document(
+                        page_content=f"[표 데이터 요약]\n{table_summary}\n\n[원본 표]\n{table_md}",
+                        metadata={
+                            "element_type": "table",
+                            "page": page_num,
+                            "source_filename": filename,
+                            "source": str(pdf_path),
+                            "table_index": t_idx,
+                            "raw_table_md": table_md,
+                        },
+                    )
+                )
+
+            # 2. 이미지/차트(Image) 추출
+            image_list = page.get_images(full=True)
+            for img_idx, img_info in enumerate(image_list):
+                xref = img_info[0]
+                base_image = doc.extract_image(xref)
+                if base_image["width"] < 120 or base_image["height"] < 120:
+                    continue
+
+                img_filename = f"page_{page_num + 1}_img_{img_idx}_{uuid.uuid4().hex[:6]}.{base_image['ext']}"
+                img_filepath = os.path.join(self.image_save_dir, img_filename)
+                with open(img_filepath, "wb") as f:
+                    f.write(base_image["image"])
+
+                img_summary = self._summarize_image(img_filepath)
+
+                visual_chunks.append(
+                    Document(
+                        page_content=f"[이미지/차트 분석]\n{img_summary}",
+                        metadata={
+                            "element_type": "image",
+                            "page": page_num,
+                            "source_filename": filename,
+                            "source": str(pdf_path),
+                            "image_path": img_filepath,
+                        },
+                    )
+                )
+
+        doc.close()
+        return visual_chunks
 
 def _layout_page_texts(pdf_path, pages):
     """페이지별 레이아웃 보존 텍스트 {page: text}. 표의 열(대상·연도) 배치가 글자 위치로 남아
@@ -66,6 +183,7 @@ def _build_db(pdf_paths, openai_key):
     documents = []
     failures = []
     page_count = 0
+    visual_chunker = VisualElementChunker(api_key=openai_key)
     for pdf_path in pdf_paths:
         filename = Path(pdf_path).name
         try:
@@ -73,7 +191,14 @@ def _build_db(pdf_paths, openai_key):
                 pages = PyPDFLoader(str(pdf_path)).load()
                 for page in pages:
                     page.metadata["source_filename"] = filename
-                chunks = splitter.split_documents(pages)
+                # 시각 요소(표, 이미지) 청크 추출
+                try:
+                    visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
+                except Exception as ve:
+                    logging.getLogger(__name__).warning("시각 청크 추출 실패(%s): %s", filename, ve)
+                    visual_chunks = []
+
+                chunks = text_chunks + visual_chunks
                 if not chunks:
                     raise ValueError(NO_TEXT_ERROR)
                 page_texts = _layout_page_texts(pdf_path, pages)
