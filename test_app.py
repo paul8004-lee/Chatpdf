@@ -1,4 +1,5 @@
 """Run: .venv/Scripts/python.exe -m unittest test_app -v (no API calls)."""
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -500,6 +501,25 @@ class AnswerCacheTest(unittest.TestCase):
         first.delete_collection.assert_called_once_with()
         self.assertIsNone(app._cache_get(first, "q"))
         self.assertEqual(app._cache_get(second, "q"), "B")
+
+
+class LogoTest(unittest.TestCase):
+    """로고가 수 KB짜리 인라인 PNG인지, 데이터가 없으면 📚로 대체되는지 확인 (#60)"""
+
+    def test_logo_is_small_inline_png(self):
+        html = app.get_logo_html()
+        self.assertIn('<img class="team-logo"', html)
+        self.assertIn("data:image/png;base64,", html)
+        png = base64.b64decode(app.LOGO_PNG_BASE64)
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertLess(len(png), 4 * 1024)
+        self.assertLess(len(html), 4 * 1024)
+
+    def test_fallback_without_logo_data(self):
+        with patch.object(app, "LOGO_PNG_BASE64", ""):
+            self.assertEqual(
+                app.get_logo_html(), '<span class="logo-fallback">📚</span>'
+            )
 
 
 if __name__ == "__main__":
