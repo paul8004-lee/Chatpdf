@@ -1404,6 +1404,21 @@ QUESTION_PROCESSING = "⏳ PDF 처리 중입니다. 완료되면 질문할 수 �
 QUESTION_NOT_REGISTERED = "🔒 등록된 PDF가 없어 질문할 수 없습니다. 위 안내를 확인하고 PDF를 다시 등록해 주세요."
 REGISTER_FAILED_NOTE = "\n\n🔒 PDF 등록에 성공해야 질문할 수 있습니다."
 
+def lock_register():
+    # 클릭 즉시(queue=False) 등록·선택 버튼과 질문을 잠가 연타로 등록이 여러 번 실행되지 않게 함 (#62)
+    # DB 삭제처럼 시간이 걸리는 작업은 다음 단계(start_register)에서 처리
+    locked = gr.update(interactive=False)
+
+    return (
+        QUESTION_PROCESSING,
+        gr.update(interactive=False, placeholder=QUESTION_PROCESSING),
+        locked,                                                  # 질문하기
+        locked,                                                  # PDF 선택
+        locked,                                                  # 파일 등록
+        locked                                                   # 선택 초기화
+    )
+
+
 def start_register(request: gr.Request):
 
     with _session_lock(request):
@@ -1503,6 +1518,44 @@ def finish_register(db, message, pdf_paths):
 # 6. 질문 및 스트리밍 답변
 # ==========================================
 
+# 답변 생성 중에는 다음 질문·대화 초기화를 막아 순서 섞임·중복 요청·추가 비용을 방지 (#62, #61)
+QUESTION_ANSWERING = "⏳ 답변을 생성하는 중입니다. 완료되면 다음 질문을 할 수 있습니다."
+
+def start_answer():
+    # 질문 전송 즉시(queue=False) 질문창·질문하기와 DB/대화를 바꾸는 버튼을 잠금 (#62)
+    # 질문창은 value를 건드리지 않아야 다음 단계(ask_question)가 입력한 질문을 그대로 받음
+    locked = gr.update(interactive=False)
+
+    return (
+        gr.update(interactive=False, placeholder=QUESTION_ANSWERING),
+        locked,                                                  # 질문하기
+        locked,                                                  # PDF 선택
+        locked,                                                  # 파일 등록
+        locked,                                                  # 선택 초기화
+        locked,                                                  # 대화 초기화 (#61)
+        locked,                                                  # 이전 기록
+        locked                                                   # TXT 다운로드
+    )
+
+
+def finish_answer(db):
+    # 답변이 끝나면(오류로 끝나도) 등록된 DB가 있을 때만 질문을 다시 허용 (#62, #55)
+    can_ask = db is not None
+    placeholder = QUESTION_READY if can_ask else QUESTION_NO_PDF
+    unlocked = gr.update(interactive=True)
+
+    return (
+        gr.update(interactive=can_ask, placeholder=placeholder),
+        gr.update(interactive=can_ask),
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked
+    )
+
+
 def ask_question(question, history, db, request: gr.Request):
     with request_log.request(LOG_PATH, "qa", secrets=(OPENAI_API_KEY,), activate=False) as trace:
         yield from request_log.iterate(trace, _ask_question(question, history, db, request))
@@ -1513,14 +1566,20 @@ def _ask_question(question, history, db, request):
     history = list(history or [])
     prior_history = deepcopy(history)
 
+    # 입력 오류는 예외를 던지지 않고 안내만 함: 예외가 나면 뒤이은 잠금 해제(finish_answer)가 실행되지 않아
+    # 화면이 잠긴 채 남음 (#62). 빈 질문은 대화에 말풍선을 남기지 않음
     if not question or not question.strip():
         request_log.current().status = "error"
         request_log.current().emit("validation_failed", reason="empty_question")
-        history.append({
-            "role": "assistant",
-            "content": "⚠️ 질문을 입력해주세요."
-        })
-        yield history, ""
+        gr.Warning("질문을 입력해주세요.", title="안내")
+        yield prior_history, ""
+        return
+
+    if len(question.strip()) > MAX_QUESTION_LEN:
+        request_log.current().status = "error"
+        request_log.current().emit("validation_failed", reason="question_too_long")
+        gr.Warning(f"질문은 {MAX_QUESTION_LEN}자 이내로 입력하세요.", title="안내")
+        yield prior_history, question                   # 고쳐 쓸 수 있게 질문을 질문창에 되돌려 줌
         return
 
     history.append({
@@ -1565,8 +1624,11 @@ def _ask_question(question, history, db, request):
                     history[-1]["content"] = str(text)
                     yield history, ""
 
-        except gr.Error:
-            raise
+        except gr.Error as e:
+            # API 키·사용 한도·연결 오류 등도 대화에 안내하고 끝내야 잠금이 풀림 (#62)
+            request_log.current().status = "error"
+            history[-1]["content"] = f"⚠️ {e.message}"
+            yield history, ""
 
         except Exception as e:
             request_log.current().status = "error"
@@ -1960,8 +2022,19 @@ with gr.Blocks(
         outputs=[selected_files, status]
     )
 
-    # PDF 처리 시작
+    # PDF 처리 시작: 즉시 잠금 → 이전 DB 정리 → 등록 → 결과·잠금 해제 (#62)
     upload_btn.click(
+        fn=lock_register,
+        outputs=[
+            status,
+            question,
+            send_btn,
+            pdf_file,
+            upload_btn,
+            reset_select_btn
+        ],
+        queue=False
+    ).then(
         fn=start_register,
         outputs=[
             db_state,
@@ -1990,33 +2063,41 @@ with gr.Blocks(
         ]
     )
 
-    # 질문하기
-    send_btn.click(
-        fn=ask_question,
-        inputs=[
-            question,
-            chatbot,
-            db_state
-        ],
-        outputs=[
-            chatbot,
-            question
-        ]
-    )
+    # 질문하기(➤) / Enter 전송: 잠금 → 스트리밍 답변 → 잠금 해제 (#62, #61)
+    # 잠금 해제는 .then이라 ask_question이 gr.Error로 끝나도 실행됨
+    answer_lock_outputs = [
+        question,
+        send_btn,
+        pdf_file,
+        upload_btn,
+        reset_select_btn,
+        clear_btn,
+        history_menu,
+        download_btn
+    ]
 
-    # Enter 전송
-    question.submit(
-        fn=ask_question,
-        inputs=[
-            question,
-            chatbot,
-            db_state
-        ],
-        outputs=[
-            chatbot,
-            question
-        ]
-    )
+    for trigger in (send_btn.click, question.submit):
+        trigger(
+            fn=start_answer,
+            outputs=answer_lock_outputs,
+            queue=False
+        ).then(
+            fn=ask_question,
+            inputs=[
+                question,
+                chatbot,
+                db_state
+            ],
+            outputs=[
+                chatbot,
+                question
+            ]
+        ).then(
+            fn=finish_answer,
+            inputs=[db_state],
+            outputs=answer_lock_outputs,
+            queue=False
+        )
 
     # 이전 대화 보관 및 초기화
     clear_btn.click(
