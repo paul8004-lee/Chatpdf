@@ -189,7 +189,7 @@ class SourceFormatTest(unittest.TestCase):
         self.assertEqual(app._page_label(d.metadata), "1")
         self.assertIn("original.pdf (p.1)", app._format_sources([d]))
         self.assertNotIn("renamed.pdf", app._format_sources([d]))
-        self.assertIn("[p.1]", app._format_docs([d]))
+        self.assertIn("[original.pdf p.1]", app._format_docs([d]))   # #59: 근거에 파일명 포함
 
     def test_fallbacks(self):
         windows = self.doc(source=r"C:\data\report.pdf", page=4)
@@ -313,6 +313,48 @@ class QuestionLockMessageTest(unittest.TestCase):
         self.assertIn("등록에 성공해야 질문할 수 있습니다", app.register_pdf(None, request)[1])
         with patch.object(app, "OPENAI_API_KEY", None):
             self.assertIn("등록에 성공해야 질문할 수 있습니다", app.register_pdf(["/tmp/x.pdf"], request)[1])
+
+
+class MultiDocumentTest(unittest.TestCase):
+    """#59: 여러 PDF를 등록했을 때 문서가 근거에서 빠지지 않고, GPT가 문서를 구분할 수 있어야 함"""
+
+    def doc(self, name, chunk_id, page=0):
+        return app.Document(page_content=f"{name} {chunk_id}",
+                            metadata={"source_filename": name, "page": page, "chunk_id": chunk_id})
+
+    def test_cover_files_adds_best_chunk_of_missing_files_only(self):
+        ranked = [self.doc("a.pdf", c) for c in ("a1", "a2", "a3", "a4", "a5")] + \
+                 [self.doc("b.pdf", "b1"), self.doc("b.pdf", "b2")]
+        unranked = [self.doc("c.pdf", "c1")]
+        picked = app._cover_files(ranked, ranked + unranked, ["a.pdf", "b.pdf", "c.pdf"])
+        self.assertEqual([d.metadata["chunk_id"] for d in picked], ["a1", "a2", "a3", "a4", "b1", "c1"])
+
+    def test_cover_files_keeps_top_k_when_all_files_present(self):
+        ranked = [self.doc("a.pdf", "a1"), self.doc("b.pdf", "b1"), self.doc("a.pdf", "a2"),
+                  self.doc("b.pdf", "b2"), self.doc("a.pdf", "a3")]
+        picked = app._cover_files(ranked, ranked, ["a.pdf", "b.pdf"])
+        self.assertEqual(len(picked), app.TOP_K)
+
+    def test_per_file_candidates_and_file_list(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            app, "OpenAIEmbeddings", return_value=LocalEmbeddings()
+        ):
+            big, small = Path(folder) / "big.pdf", Path(folder) / "small.pdf"
+            write_pdf(big, ["apple orchard", "apple harvest", "apple pie", "apple juice"])
+            write_pdf(small, ["banana plantation"])
+            db, _ = app.build_db([str(big), str(small)], "test")
+            self.assertEqual(app._db_files(db), ["big.pdf", "small.pdf"])
+            only_big = [d for d in db.similarity_search("apple", k=2)]
+            candidates = app._add_file_candidates(db, only_big, "apple", app._db_files(db))
+            self.assertIn("small.pdf", {d.metadata["source_filename"] for d in candidates})
+            self.assertEqual(len({app._chunk_key(d) for d in candidates}), len(candidates))   # 중복 없음
+            app._delete_db(db)
+            self.assertNotIn(app._cache_key(db), app._db_files_cache)
+
+    def test_context_labels_each_chunk_with_its_file(self):
+        context = app._format_docs([self.doc("a.pdf", "x", page=2), self.doc("b.pdf", "y", page=0)])
+        self.assertIn("[a.pdf p.3]", context)
+        self.assertIn("[b.pdf p.1]", context)
 
 
 class AnswerCacheTest(unittest.TestCase):

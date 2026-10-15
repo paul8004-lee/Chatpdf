@@ -1,13 +1,15 @@
-"""#37 답변 품질 평가 (표 비교 · 목록 완전성 · 공통성 판단 · 거절)
+"""답변 품질 평가 (#37 표 비교·목록·공통성, #59 여러 문서 비교·종합)
 
 무엇을 하나요?
-  eval/issue37_questions.jsonl의 질문을 PDF별로 실제 앱의 answer()로 답하게 하고,
+  질문 파일(기본 eval/issue37_questions.jsonl)의 질문을 PDF(또는 PDF 묶음)별로 실제 앱의 answer()로 답하게 하고,
   GPT 채점기가 정답 요약(gold)과 비교해 ✅(1) / △(0.5) / ❌(0)으로 채점합니다.
   질문마다 응답 시간, 토큰 수, 비용(USD)도 함께 기록합니다.
 
 실행 방법 (프로젝트 폴더에서, .venv 켠 상태):
   python eval/eval_issue37.py --label before
   python eval/eval_issue37.py --label after
+  python eval/eval_issue37.py --questions eval/issue59_questions.jsonl --label before
+  (질문의 "pdf"는 PDF 1개, "pdfs"는 함께 등록할 PDF 목록)
 
 준비물:
   - .env의 OPENAI_API_KEY
@@ -15,7 +17,7 @@
     (출처는 docs/sources.md, PDF는 저장소에 올리지 않음)
 
 결과:
-  - eval/results_issue37_<label>.csv (질문별 답변·점수·근거·시간·토큰·비용)
+  - eval/results_<질문 파일 이름>_<label>.csv (질문별 답변·점수·근거·시간·토큰·비용)
   - 화면에 유형별·세트별 요약 출력
 """
 import argparse
@@ -95,24 +97,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--label", required=True, help="결과 파일 이름에 붙일 이름 (예: before, after)")
     parser.add_argument("--only", nargs="*", help="특정 질문 id만 실행 (예: Q44 P1)")
+    parser.add_argument("--questions", default=str(ROOT / "eval" / "issue37_questions.jsonl"),
+                        help="질문 파일 경로 (jsonl)")
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
     key = os.environ["OPENAI_API_KEY"]
     judge = ChatOpenAI(model=JUDGE_MODEL, temperature=0, max_tokens=400,
                        api_key=key).with_structured_output(Verdict)
-    questions = [json.loads(line) for line in (ROOT / "eval" / "issue37_questions.jsonl").read_text().splitlines()
-                 if line.strip()]
+    questions_path = Path(args.questions)
+    questions = [json.loads(line) for line in questions_path.read_text().splitlines() if line.strip()]
     if args.only:
         questions = [q for q in questions if q["id"] in args.only]
 
     by_pdf = defaultdict(list)
     for q in questions:
-        by_pdf[q["pdf"]].append(q)
+        by_pdf[tuple(q.get("pdfs") or [q["pdf"]])].append(q)
 
     rows = []
-    for pdf_name, qs in by_pdf.items():
-        db, message = app.build_db([str(find_pdf(pdf_name))], key)
+    for pdf_names, qs in by_pdf.items():
+        pdf_name = " + ".join(pdf_names)
+        db, message = app.build_db([str(find_pdf(name)) for name in pdf_names], key)
         print(f"\n[{pdf_name}] {message}")
         for q in qs:
             answer, seconds, tokens, cost = run_answer(q["question"], key, db)
@@ -125,7 +130,8 @@ def main():
             print(f"  {q['id']:>4} {MARKS[mark]} {seconds:5.1f}s {tokens:>6}tok  {verdict.reason[:70]}")
         db.delete_collection()
 
-    out = ROOT / "eval" / f"results_issue37_{args.label}.csv"
+    name = questions_path.stem.replace("_questions", "")
+    out = ROOT / "eval" / f"results_{name}_{args.label}.csv"
     with out.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()

@@ -290,6 +290,7 @@ CACHE_SIZE = 100                 # 답변 캐시(임시 저장소)에 보관할 
 LOG_PATH = Path("eval/qa_log.jsonl")  # 질문별 성능 기록을 저장할 파일 위치
 
 _answer_cache = {}               # 답변 캐시: {(PDF 컬렉션 이름, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
+_db_files_cache = {}             # DB별 등록 파일 이름 목록: {PDF 컬렉션 이름: [파일명, ...]}
 
 # ---------- 프롬프트 1: 멀티쿼리 (검색어 늘리기) ----------
 # 질문 하나로만 검색하면 표현이 조금만 달라도 관련 내용을 놓칠 수 있음.
@@ -319,7 +320,8 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
      "규칙:\n"
      "1. 아래 [문서] 내용만 근거로 한국어로 답하세요.\n"                            # 근거 제한
      "2. 문서에 없는 내용은 추측하지 말고 '문서에서 확인할 수 없습니다'라고 답하세요.\n"  # 모르면 모른다고
-     "3. 수치는 문서 표현 그대로 쓰고, 근거 문장 끝에 (p.페이지) 형식으로 표시하세요.\n"  # 출처 표시
+     "3. 수치는 문서 표현 그대로 쓰고, 근거 문장 끝에 (p.페이지) 형식으로 표시하세요. "
+     "[문서]에 파일이 여럿이면 (파일명 p.페이지)로 표시하세요.\n"                    # 출처 표시
      "4. 핵심부터 간결하게 답하세요.\n"                                           # 답변 스타일
      "5. 표: 행(항목)과 열(연도·기간)을 맞춰 읽고, 비교·증감 질문은 해당 수치를 직접 비교해 답하세요. "
      "표에 필요한 수치가 있으면 '확인할 수 없다'고 하지 마세요. 일부만 확인되면 확인되는 부분은 답하고 "
@@ -328,7 +330,11 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
      "원문 명칭 그대로 나열하세요. 문서에 없는 항목은 만들지 마세요.\n"               # 목록 완전성 (#37)
      "7. 공통점: 여러 대상의 '공통' 특징을 물으면 모든 대상에 실제로 나타나는 것만 공통이라고 하세요. "
      "일부 대상에만 해당하면 대상별로 구분해 쓰고, 공통 요소가 없으면 없다고 답하세요.\n"  # 잘못된 일반화 방지 (#37)
-     "8. 표가 글자로 풀려 열(대상) 구분이 불분명하면 단정하지 말고 그 한계를 밝히세요.\n\n"
+     "8. 표가 글자로 풀려 열(대상) 구분이 불분명하면 단정하지 말고 그 한계를 밝히세요.\n"
+     "9. 여러 문서: 문서·보고서끼리 비교하거나 '각각' 묻는 질문은 [문서]의 [파일명 p.N] 표시로 문서를 구분해 "
+     "문서별 근거를 먼저 정리한 뒤 비교하세요. 질문한 문서마다 답하고, 특정 문서에 근거가 없으면 그 문서만 "
+     "확인할 수 없다고 밝히세요. 대상·기간·기준이 다른 수치는 직접 비교의 한계를 밝히고, 문서에 없는 "
+     "인과관계나 연결은 만들지 마세요.\n\n"                                         # 여러 문서 비교·종합 (#59)
      "[문서]\n{context}"),                                                        # {context}에 검색된 PDF 내용이 들어감
     ("human", "{question}"),                                                      # {question}에 사용자 질문이 들어감
 ])
@@ -353,9 +359,10 @@ def _source_name(meta):
 
 
 def _format_docs(docs):
-    """검색된 PDF 조각들을 GPT에게 보낼 하나의 글로 합침. 조각마다 [p.페이지]를 앞에 붙임."""
+    """검색된 PDF 조각들을 GPT에게 보낼 하나의 글로 합침. 조각마다 [파일명 p.페이지]를 앞에 붙임.
+    여러 PDF를 함께 등록했을 때 GPT가 어느 내용이 어느 문서인지 구분할 수 있게 파일명을 넣음 (#59)."""
     return "\n\n".join(                                         # 조각 사이를 빈 줄로 구분해서 이어 붙임
-        f"[p.{_page_label(d.metadata)}] {d.page_content}"       # 예: "[p.3] 2026년 성장률은 ..."
+        f"[{_source_name(d.metadata)} p.{_page_label(d.metadata)}] {d.page_content}"  # 예: "[report.pdf p.3] 2026년 성장률은 ..."
         for d in docs                                           # 검색된 조각을 하나씩 처리
     )
 
@@ -374,18 +381,65 @@ def _format_sources(docs):
     return "\n\n---\n**참고**: " + " / ".join(parts)              # 구분선(---) 아래에 굵은 글씨 '참고'로 표시
 
 
-def _rerank(llm, docs, query):
-    """[업그레이드 1] 검색된 조각들 중 질문과 가장 관련 있는 TOP_K개를 GPT가 골라 순서를 다시 매김."""
-    if len(docs) <= TOP_K:                                      # 조각이 이미 TOP_K개 이하면 고를 필요가 없으니
+def _rerank(llm, docs, query, top_n=TOP_K):
+    """[업그레이드 1] 검색된 조각들 중 질문과 가장 관련 있는 top_n개를 GPT가 골라 순서를 다시 매김."""
+    if len(docs) <= top_n:                                      # 조각이 이미 top_n개 이하면 고를 필요가 없으니
         return docs                                             #   그대로 돌려줌 (API 호출 절약)
     try:
         with request_log.stage("rerank"):
-            reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=TOP_K)
-            return list(reranker.compress_documents(docs, query)) or docs[:TOP_K]
+            reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=top_n)
+            return list(reranker.compress_documents(docs, query)) or docs[:top_n]
     except Exception:                                           # 재정렬 중 어떤 오류가 나도
         if request_log.current():
             request_log.current().emit("rerank_fallback", status="fallback")
-        return docs[:TOP_K]                                     #   답변은 계속되도록 원래 순서의 앞 TOP_K개를 사용
+        return docs[:top_n]                                     #   답변은 계속되도록 원래 순서의 앞 top_n개를 사용
+
+
+def _db_files(db):
+    """DB에 등록된 원본 파일 이름 목록 (컬렉션별로 한 번만 조회)."""
+    key = _cache_key(db)
+    if key not in _db_files_cache:
+        try:
+            metadatas = db.get(include=["metadatas"])["metadatas"]
+            _db_files_cache[key] = sorted({_source_name(m) for m in metadatas if m})
+        except Exception:
+            return []
+    return _db_files_cache[key]
+
+
+def _chunk_key(doc):
+    return doc.metadata.get("chunk_id") or (_source_name(doc.metadata), doc.metadata.get("page"), doc.page_content)
+
+
+def _add_file_candidates(db, docs, query, files):
+    """[#59] 여러 PDF가 등록돼 있으면 파일마다 관련 조각을 2개씩 더 찾아 후보에 넣음.
+    전체 검색만 하면 내용이 많은 한 문서가 후보를 독차지해 다른 문서가 비교·종합에서 빠지기 때문."""
+    seen = {_chunk_key(d) for d in docs}
+    candidates = list(docs)
+    for name in files:
+        try:
+            found = db.max_marginal_relevance_search(query, k=2, fetch_k=8, filter={"source_filename": name})
+        except Exception:
+            continue
+        for doc in found:
+            if _chunk_key(doc) not in seen:
+                seen.add(_chunk_key(doc))
+                candidates.append(doc)
+    return candidates
+
+
+def _cover_files(ranked, candidates, files):
+    """[#59] 재정렬 상위 TOP_K개에 없는 파일이 있으면, 그 파일에서 가장 순위가 높은 조각을 1개씩 보충함.
+    한 문서만 근거로 쓰여 '각각'·'비교' 질문에서 다른 문서가 빠지는 문제를 막음."""
+    ordered = list(ranked) + [d for d in candidates if d not in ranked]
+    picked = list(ranked[:TOP_K])
+    covered = {_source_name(d.metadata) for d in picked}
+    for doc in ordered[TOP_K:]:
+        name = _source_name(doc.metadata)
+        if name in files and name not in covered:
+            picked.append(doc)
+            covered.add(name)
+    return picked
 
 
 def _cache_key(db):
@@ -410,6 +464,7 @@ def _cache_clear(db):
     key = _cache_key(db)
     for cache_key in [k for k in list(_answer_cache) if k[0] == key]:
         _answer_cache.pop(cache_key, None)
+    _db_files_cache.pop(key, None)                              # 등록 파일 목록 캐시도 정리 (#59)
 
 
 def _log(**record):
@@ -536,7 +591,14 @@ def _answer(question, openai_key, db, history=None):
         finally:
             trace.usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
                         stage="retrieval_embeddings")
-        docs = _rerank(llm, docs, search_question)              # [업그레이드 1] 8개 중 가장 관련 있는 4개로 추림
+        files = _db_files(db)
+        if len(files) > 1:                                      # [#59] 여러 PDF: 파일별 후보 추가 → 전체 순위 → 빠진 파일 보충
+            candidates = _add_file_candidates(db, docs, search_question, files)
+            # top_n을 후보 수보다 작게 해야 실제로 재정렬됨 (같거나 크면 _rerank가 재정렬을 건너뜀)
+            ranked = _rerank(llm, candidates, search_question, top_n=TOP_K + len(files))
+            docs = _cover_files(ranked, candidates, files)
+        else:
+            docs = _rerank(llm, docs, search_question)          # [업그레이드 1] 8개 중 가장 관련 있는 4개로 추림
         with request_log.stage("selected_context"):
             _log_documents(db, docs)
         with request_log.stage("page_context"):                 # [#37] 고른 조각을 페이지 전체로 넓힘
