@@ -122,8 +122,9 @@ class SearchTest(unittest.TestCase):
             out = list(app.answer("apple?", "test", db))
         self.assertIn("**참고**", out[-1])                               # 답변은 정상 완료
         log = [json.loads(line) for line in app.LOG_PATH.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(log[-1]["mode"], "multiquery_rerank")
-        self.assertIs(log[-1]["rerank_ok"], False)
+        result = [r for r in log if r.get("event") == "qa_result"][-1]   # request_log(#49) 형식: 질문 결과 이벤트
+        self.assertEqual(result["mode"], "multiquery_rerank")
+        self.assertIs(result["rerank_ok"], False)
 
     def test_unknown_mode_raises(self):
         """없는 검색 방식 이름을 쓰면 바로 오류로 알려줌."""

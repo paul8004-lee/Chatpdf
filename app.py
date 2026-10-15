@@ -4,18 +4,180 @@ import uuid
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
+from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
+import request_log
+import base64
+import os
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+
+# 표·이미지 청킹용 PyMuPDF가 없어도 앱은 켜지고 텍스트 PDF 등록은 되도록 함 (#65)
+try:
+    import pymupdf as fitz
+except ImportError:
+    fitz = None
+    logging.getLogger(__name__).warning("pymupdf가 없어 표·이미지 청킹을 건너뜁니다. pip install -r requirements.txt")
+
+NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
+VISUAL_MAX_WORKERS = 4                                    # 표·이미지 요약 GPT 호출 동시 실행 수
+IMAGE_SAVE_DIR = os.path.join(tempfile.gettempdir(), "chatpdf_images")  # 추출 이미지 저장 위치 (프로젝트 폴더 밖)
+
+
+def _visual_chunks_enabled():
+    """.env의 VISUAL_CHUNKS=0/false/off 이면 표·이미지 청킹(GPT 호출)을 건너뜀. 기본은 사용."""
+    return os.getenv("VISUAL_CHUNKS", "1").strip().lower() not in ("0", "false", "off", "no")
+
+# ==========================================
+# 표 / 이미지 전담 청킹 클래스 정의
+# ==========================================
+class VisualElementChunker:
+    """PDF 내에서 일반 텍스트는 건너뛰고, '표(Table)'와 '이미지/차트(Image)'만 전담으로 추출 및 요약 청킹"""
+
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "gpt-4o-mini",
+        image_save_dir: str = IMAGE_SAVE_DIR,
+    ):
+        self.llm = ChatOpenAI(model=model_name, temperature=0.0, api_key=api_key)
+        self.image_save_dir = image_save_dir
+        os.makedirs(self.image_save_dir, exist_ok=True)
+
+    def _summarize_image(self, image_path: str) -> str:
+        with open(image_path, "rb") as f:
+            b64_image = base64.b64encode(f.read()).decode("utf-8")
+
+        prompt = """
+        당신은 데이터 시각화 및 문서 분석 전문가입니다.
+        제공된 이미지(차트, 그래프, 다이어그램 등)를 면밀히 분석하여 핵심 정보를 기술하세요.
+        - 차트/그래프 종류 (예: 꺾은선, 막대, 파이차트 등)
+        - 축 레이블, 범례, 주요 수치 데이터 및 증감 트렌드
+        - 이미지가 전달하고자 하는 핵심 결론
+        사용자가 자연어로 질문했을 때 벡터 검색에 잘 걸리도록 핵심 키워드와 숫자를 포함해 요약하세요.
+        """
+        message = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+                },
+            ]
+        )
+        response = self.llm.invoke([message])
+        return response.content
+
+    def _summarize_table(self, table_markdown: str) -> str:
+        prompt = f"""
+        다음 표의 구조와 수치 데이터를 분석하여 핵심 요약문을 작성하세요.
+        사용자가 자연어로 검색할 때 이 표가 잘 검색될 수 있도록 주요 항목명, 수치, 결론을 포함하세요.
+
+        [표 데이터]
+        {table_markdown}
+        """
+        response = self.llm.invoke(prompt)
+        return response.content
+
+    def extract_visual_chunks(self, pdf_path: str, filename: str) -> list[Document]:
+        """표·이미지를 찾아 GPT 요약 청크로 만듦.
+        1) 페이지를 돌며 표·이미지를 먼저 모으고 → 2) GPT 요약을 동시에 실행(VISUAL_MAX_WORKERS개씩)
+        → 3) 원래 순서(페이지 순, 페이지 안에서는 표 → 이미지)대로 청크를 만듦."""
+        doc = fitz.open(pdf_path)
+        items = []                                        # (종류, 페이지, 번호, 요약할 내용, 추가 메타데이터)
+        try:
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
+                page_num = page_idx  # 0-based page index
+
+                # 1. 표(Table) 추출
+                for t_idx, table in enumerate(page.find_tables()):
+                    df = table.to_pandas()
+                    if df.empty or df.shape[0] < 1:
+                        continue
+                    table_md = df.to_markdown(index=False)
+                    items.append(("table", page_num, t_idx, table_md, {"table_index": t_idx, "raw_table_md": table_md}))
+
+                # 2. 이미지/차트(Image) 추출
+                for img_idx, img_info in enumerate(page.get_images(full=True)):
+                    base_image = doc.extract_image(img_info[0])
+                    if base_image["width"] < 120 or base_image["height"] < 120:
+                        continue
+                    img_filename = f"page_{page_num + 1}_img_{img_idx}_{uuid.uuid4().hex[:6]}.{base_image['ext']}"
+                    img_filepath = os.path.join(self.image_save_dir, img_filename)
+                    with open(img_filepath, "wb") as f:
+                        f.write(base_image["image"])
+                    items.append(("image", page_num, img_idx, img_filepath, {"image_path": img_filepath}))
+        finally:
+            doc.close()
+
+        def summarize(item):
+            kind, _, _, content, _ = item
+            return self._summarize_table(content) if kind == "table" else self._summarize_image(content)
+
+        # GPT 요약을 동시에 실행. map은 입력 순서대로 결과를 돌려주고, 하나라도 실패하면 예외가 그대로 올라감 (기존과 동일)
+        with ThreadPoolExecutor(max_workers=VISUAL_MAX_WORKERS) as pool:
+            summaries = list(pool.map(summarize, items))
+
+        visual_chunks: list[Document] = []
+        for (kind, page_num, _, content, extra), summary in zip(items, summaries):
+            page_content = (f"[표 데이터 요약]\n{summary}\n\n[원본 표]\n{content}" if kind == "table"
+                            else f"[이미지/차트 분석]\n{summary}")
+            visual_chunks.append(Document(
+                page_content=page_content,
+                metadata={"element_type": kind, "page": page_num, "source_filename": filename,
+                          "source": str(pdf_path), **extra},
+            ))
+        return visual_chunks
+
+def _layout_page_texts(pdf_path, pages):
+    """페이지별 레이아웃 보존 텍스트 {page: text}. 표의 열(대상·연도) 배치가 글자 위치로 남아
+    여러 열짜리 표를 GPT가 열별로 읽을 수 있게 함 (#37). 실패하면 일반 추출 텍스트를 사용."""
+    try:
+        reader = PdfReader(str(pdf_path))
+        texts = {}
+        for index, page in enumerate(reader.pages):
+            lines = (line.rstrip() for line in page.extract_text(extraction_mode="layout").splitlines())
+            texts[index] = "\n".join(line for line in lines if line.strip())
+        return texts
+    except Exception:
+        return {page.metadata.get("page"): page.page_content for page in pages}
+
+
+def _load_failure_reason(error):
+    """파일 하나를 읽거나 나누다 실패한 이유를 사용자에게 보여줄 문구로 바꾼다."""
+    if isinstance(error, ValueError) and str(error) == NO_TEXT_ERROR:
+        return "텍스트가 없는 PDF(이미지·스캔본)"
+    return "PDF를 읽을 수 없음(손상되었거나 PDF 형식이 아님)"
+
 
 def build_db(pdf_paths, openai_key):
+    """Process PDF paths and append request diagnostics without storing credentials."""
+    with request_log.request(LOG_PATH, "pdf_processing", secrets=(openai_key,)) as trace:
+        db, message = _build_db(pdf_paths, openai_key)
+        if db is None:
+            trace.status = "error" if pdf_paths else "empty"
+        trace.emit("pdf_result", status=trace.status, message=message,
+                   collection=getattr(db, "_collection_name", None) if db is not None else None)
+        return db, message
+
+
+def _build_db(pdf_paths, openai_key):
     """단일 경로 또는 경로 목록을 받아 (새 DB, 처리 메시지)를 반환한다.
 
-    실패 시 DB는 None이다. 기존 DB 해제와 질문 상태 제어는 호출자가 담당한다.
+    파일별로 읽기·분할하고, 실패한 파일은 제외한 채 성공한 파일만으로 DB를 만든다 (#42).
+    모든 파일이 실패하거나 임베딩·저장이 실패하면 DB는 None이다.
+    기존 DB 해제와 질문 상태 제어는 호출자가 담당한다.
     """
     if not pdf_paths:
         return None, ""
     if not openai_key or not openai_key.strip():
+        request_log.current().emit("validation_failed", reason="missing_api_key")
         return None, "⚠️ OpenAI API 키를 입력한 뒤 PDF를 다시 올려주세요."
     if isinstance(pdf_paths, (str, Path)):
         pdf_paths = [pdf_paths]
@@ -24,29 +186,74 @@ def build_db(pdf_paths, openai_key):
         length_function=len, is_separator_regex=False,
     )
     documents = []
+    failures = []
     page_count = 0
+    # 시각 청킹 준비가 실패해도 텍스트 청크만으로 등록을 이어감 (#65)
+    visual_chunker = None
+    if fitz is not None and _visual_chunks_enabled():
+        try:
+            visual_chunker = VisualElementChunker(api_key=openai_key)
+        except Exception as error:
+            logging.getLogger(__name__).warning("시각 청킹 준비 실패: %s", error)
+    for pdf_path in pdf_paths:
+        filename = Path(pdf_path).name
+        try:
+            with request_log.stage("pdf_load_split"):
+                pages = PyPDFLoader(str(pdf_path)).load()
+                for page in pages:
+                    page.metadata["source_filename"] = filename
+                text_chunks = splitter.split_documents(pages)
+                # 시각 요소(표, 이미지) 청크 추출
+                visual_chunks = []
+                if visual_chunker is not None:
+                    try:
+                        visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
+                    except Exception as ve:
+                        logging.getLogger(__name__).warning("시각 청크 추출 실패(%s): %s", filename, ve)
+
+                chunks = text_chunks + visual_chunks
+                if not chunks:
+                    raise ValueError(NO_TEXT_ERROR)
+                page_texts = _layout_page_texts(pdf_path, pages)
+                for chunk in chunks:
+                    chunk.metadata["chunk_id"] = uuid.uuid4().hex
+                    # 답변할 때 이 조각이 속한 페이지 전체(표의 열 배치 유지)를 근거로 쓰기 위해 저장 (#37)
+                    chunk.metadata["page_text"] = page_texts.get(chunk.metadata.get("page"), "")
+                request_log.current().emit("pdf_loaded", filename=filename,
+                                           pages=len(pages), chunks=len(chunks))
+        except Exception as error:
+            request_log.current().emit("pdf_excluded", filename=filename,
+                                       reason=_load_failure_reason(error))
+            failures.append((filename, _load_failure_reason(error)))
+            continue
+        documents.append((filename, chunks))
+        page_count += len(pages)
+
+    failure_lines = "\n".join(f"- {name}: {reason}" for name, reason in failures)
+    if not documents:
+        return None, f"❌ 처리 실패: 등록할 수 있는 PDF가 없습니다.\n{failure_lines}"
+
+    # 임베딩·저장 실패는 API 키·연결 문제라 전체 실패로 처리
     db = None
-    filename = Path(pdf_paths[0]).name
     try:
-        for pdf_path in pdf_paths:
-            filename = Path(pdf_path).name
-            pages = PyPDFLoader(str(pdf_path)).load()
-            for page in pages:
-                page.metadata["source_filename"] = filename
-            chunks = splitter.split_documents(pages)
-            if not chunks:
-                raise ValueError("검색 가능한 텍스트가 없습니다.")
-            documents.append((filename, chunks))
-            page_count += len(pages)
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=openai_key)
-        db = Chroma(collection_name=f"pdf_{uuid.uuid4().hex}", embedding_function=embeddings)
-        for filename, chunks in documents:
-            db.add_documents(chunks)
+        with request_log.stage("embedding_storage"):
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=openai_key)
+            db = Chroma(collection_name=f"pdf_{uuid.uuid4().hex}", embedding_function=embeddings)
+            for filename, chunks in documents:
+                db.add_documents(chunks, ids=[c.metadata["chunk_id"] for c in chunks])
     except Exception:
         _delete_db(db)
-        return None, f"❌ 처리 실패: {filename}. PDF 파일과 API 키/연결을 확인하세요."
+        return None, f"❌ 처리 실패: {filename}. API 키/연결을 확인하세요."
+    finally:
+        # LangChain embeddings do not expose response usage to callbacks.
+        request_log.current().usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
+                                    stage="embedding_storage")
     chunk_count = sum(len(chunks) for _, chunks in documents)
-    return db, f"✅ 처리 완료: {len(documents)}개 파일 · {page_count}페이지 · {chunk_count}개 청크"
+    message = f"✅ 처리 완료: {len(documents)}개 파일 · {page_count}페이지 · {chunk_count}개 청크"
+    if failures:
+        request_log.current().status = "partial"
+        message += f"\n\n⚠️ 제외된 파일 {len(failures)}개\n{failure_lines}"
+    return db, message
 
 
 # ===== Step 2. 질문 처리 (feature/qa-chain) =====
@@ -56,11 +263,9 @@ def build_db(pdf_paths, openai_key):
 # Step 2에서 쓰는 import는 이 구역에 모아 둡니다. (다른 Step과 merge 충돌 방지)
 
 # ---------- 파이썬 기본 라이브러리 ----------
-import json                      # 성능 기록을 JSON 형식(한 줄짜리 텍스트)으로 저장할 때 사용
 import re                        # 정규표현식: 파일 경로에서 파일 이름 자르기, 문장 나누기, 질문 단어 뽑기에 사용
 import time                      # 답변에 걸린 시간(초)을 잴 때 사용
 import weakref                   # DB 객체가 사라지는 순간을 감지해서 그 DB의 캐시를 지울 때 사용
-from datetime import datetime    # 성능 기록에 "언제 질문했는지" 날짜·시간을 남길 때 사용
 
 
 # ---------- 외부 패키지 (requirements.txt로 설치됨) ----------
@@ -68,13 +273,15 @@ import gradio as gr              # 웹 화면 라이브러리. 여기서는 gr.E
 import openai                    # OpenAI 공식 라이브러리. API 키 오류 등 '오류 종류'를 구분하는 데 사용
 from langchain.retrievers.document_compressors import LLMListwiseRerank  # GPT가 검색 결과의 순위를 다시 매겨주는 도구
 from langchain.retrievers.multi_query import MultiQueryRetriever         # 질문 하나를 여러 표현으로 바꿔 여러 번 검색하는 도구
+from langchain_core.documents import Document                                     # 페이지 단위로 이어 붙인 근거를 담는 문서 객체
 from langchain_core.output_parsers import StrOutputParser                        # GPT 응답 객체에서 '글자(문자열)'만 꺼내주는 도구
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate            # GPT에게 보낼 지시문(프롬프트) 틀을 만드는 도구
-from langchain_openai import ChatOpenAI                                          # LangChain에서 GPT 모델을 부르는 도구
+# ChatOpenAI(GPT 호출 도구)는 Step 1 import를 같이 사용
 
 # ---------- 설정값 (숫자만 바꾸면 동작이 바뀜) ----------
 MODEL_NAME = "gpt-4o-mini"       # 사용할 GPT 모델 이름
 TOP_K = 4                        # 최종적으로 GPT에게 넘겨줄 PDF 조각 개수
+MAX_CONTEXT_CHARS = 10000        # 페이지 단위로 넓힌 근거 글자 수 상한 (비용·속도 보호)
 MAX_QUESTION_LEN = 500           # 질문 최대 글자 수 (너무 긴 질문은 비용이 커서 막음)
 MAX_HISTORY_TURNS = 3            # 후속 질문을 이해하려고 참고할 '최근 대화' 개수 (질문+답변 한 쌍이 1개)
 CACHE_SIZE = 100                 # 답변 캐시(임시 저장소)에 보관할 최대 질문 수
@@ -125,7 +332,15 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
      "1. 아래 [문서] 내용만 근거로 한국어로 답하세요.\n"                            # 근거 제한
      "2. 문서에 없는 내용은 추측하지 말고 '문서에서 확인할 수 없습니다'라고 답하세요.\n"  # 모르면 모른다고
      "3. 수치는 문서 표현 그대로 쓰고, 근거 문장 끝에 (p.페이지) 형식으로 표시하세요.\n"  # 출처 표시
-     "4. 핵심부터 간결하게 답하세요.\n\n"                                         # 답변 스타일
+     "4. 핵심부터 간결하게 답하세요.\n"                                           # 답변 스타일
+     "5. 표: 행(항목)과 열(연도·기간)을 맞춰 읽고, 비교·증감 질문은 해당 수치를 직접 비교해 답하세요. "
+     "표에 필요한 수치가 있으면 '확인할 수 없다'고 하지 마세요. 일부만 확인되면 확인되는 부분은 답하고 "
+     "확인되지 않는 부분만 그렇다고 밝히세요.\n"                                    # 표 비교 (#37)
+     "6. 목록: '모두', '구성', '3대', 'N개'처럼 전체를 묻거나 문서가 개수를 제시하면 문서의 항목을 하나도 빠뜨리지 말고 "
+     "원문 명칭 그대로 나열하세요. 문서에 없는 항목은 만들지 마세요.\n"               # 목록 완전성 (#37)
+     "7. 공통점: 여러 대상의 '공통' 특징을 물으면 모든 대상에 실제로 나타나는 것만 공통이라고 하세요. "
+     "일부 대상에만 해당하면 대상별로 구분해 쓰고, 공통 요소가 없으면 없다고 답하세요.\n"  # 잘못된 일반화 방지 (#37)
+     "8. 표가 글자로 풀려 열(대상) 구분이 불분명하면 단정하지 말고 그 한계를 밝히세요.\n\n"
      "[문서]\n{context}"),                                                        # {context}에 검색된 PDF 내용이 들어감
     ("human", "{question}"),                                                      # {question}에 사용자 질문이 들어감
 ])
@@ -166,6 +381,15 @@ def _source_name(meta):
     return name or "문서"                                        # 그래도 비어 있으면 '문서'
 
 
+def _page_label(meta):
+    """(develop #28·#49 호환) 화면에 쓰는 페이지 번호. 실제 PDF 페이지(page + 1)를 우선하고,
+    page가 없을 때만 인쇄 라벨('iv' 등), 둘 다 없으면 '?'."""
+    page = _page_number(meta)                                   # 실제 PDF 페이지 (없으면 '?')
+    if page != "?":
+        return page
+    return _printed_label(meta) or "?"                          # page가 없으면 인쇄 라벨로 대체
+
+
 def _format_docs(docs):
     """검색된 PDF 조각들을 GPT에게 보낼 하나의 글로 합침. 조각마다 [p.실제페이지]를 앞에 붙임."""
     return "\n\n".join(                                         # 조각 사이를 빈 줄로 구분해서 이어 붙임
@@ -189,8 +413,7 @@ def _format_sources(docs):
     sort_key = lambda p: (0, int(p)) if p.isdigit() else (1, p)  # 숫자 페이지는 숫자 순서로, '?' 같은 건 뒤로 정렬
     parts = []                                                  # 파일마다 한 덩어리씩 담을 목록
     for name, entry in pages.items():
-        items = [f"{p} (인쇄 {entry[p]})" if entry[p] else p    # 라벨이 다를 때만 "5 (인쇄 iv)" 형태
-                 for p in sorted(entry, key=sort_key)]
+        items = sorted(entry, key=sort_key)                     # develop #28 기준: 실제 PDF 페이지만 표시 (인쇄 라벨 생략)
         parts.append(f"{name} (p.{', '.join(items)})")          # 예: "report.pdf (p.2, 5 (인쇄 iv))"
     return "\n\n---\n**참고**: " + " / ".join(parts)              # 구분선(---) 아래에 굵은 글씨 '참고'로 표시
 
@@ -270,7 +493,7 @@ def _format_evidence(docs, question):
     return "\n\n**근거 원문**\n" + "\n>\n".join(lines)           # 항목 사이는 빈 인용줄(>)로 띄워서 따로 보이게 함
 
 
-def _rerank(llm, docs, query, k=None):
+def _rerank_checked(llm, docs, query, k=None):
     """검색된 조각 중 질문과 가장 관련 있는 k개를 GPT가 골라 순서를 다시 매김.
     반환: (조각 목록, 재정렬 성공 여부)
     """
@@ -282,15 +505,23 @@ def _rerank(llm, docs, query, k=None):
         return docs, True
 
     try:
-        reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=k)
-        ranked = list(reranker.compress_documents(docs, query))
+        with request_log.stage("rerank"):                       # [#49] 요청 로그에 재정렬 단계 기록
+            reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=k)
+            ranked = list(reranker.compress_documents(docs, query))
         if ranked:
             return ranked, True
         # 결과가 비면 원래 순서의 앞 k개 사용 (실패로 기록)
         return docs[:k], False
     except Exception:
         # 오류가 나도 답변은 계속되도록 원래 순서의 앞 k개 사용 (실패로 기록)
+        if request_log.current():                               # [#49] 요청 로그에 대체 사용 기록
+            request_log.current().emit("rerank_fallback", status="fallback")
         return docs[:k], False
+
+
+def _rerank(llm, docs, query, k=None):
+    """(develop #49 호환) 재정렬 결과 목록만 돌려줌. 성공 여부까지 필요하면 _rerank_checked 사용."""
+    return _rerank_checked(llm, docs, query, k)[0]
 
 
 def _retrieve(db, llm, query, mode=None, k=None):
@@ -329,7 +560,7 @@ def _retrieve(db, llm, query, mode=None, k=None):
         return docs[:k], None
 
     # 4) 재정렬: 후보 k×2개 중 GPT가 k개를 고름
-    return _rerank(llm, docs[: k * 2], query, k)
+    return _rerank_checked(llm, docs[: k * 2], query, k)
 
 
 def _db_key(db):
@@ -371,6 +602,11 @@ def _watch_db(db, key):
         pass                                                     #   자동 정리만 생략 (캐시 구분은 정상 동작)
 
 
+def _cache_key(db):
+    """캐시에서 PDF DB를 구분하는 열쇠. id(db)는 DB 해제 후 재사용될 수 있어 컬렉션 이름(UUID)을 사용함 (#24)"""
+    return getattr(db, "_collection_name", None) or id(db)       # build_db가 만든 컬렉션 이름: pdf_<uuid>
+
+
 def _cache_get(db, query):
     """[업그레이드 2] 같은 PDF(db)에 같은 질문(query)을 한 적이 있으면 저장해 둔 답변을 꺼냄. 없으면 None."""
     _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
@@ -400,15 +636,46 @@ def clear_answer_cache(db=None):
     return _remove_cache_of(_db_key(db))                         # 이 PDF의 캐시만 삭제
 
 
+def _cache_clear(db):
+    """(develop #24 호환) 화면의 _delete_db()가 DB를 지우기 전에 호출. 그 DB의 캐시만 지움."""
+    clear_answer_cache(db)
+
+
 def _log(**record):
-    """[업그레이드 3] 질문 1개마다 걸린 시간 등을 eval/qa_log.jsonl 파일에 한 줄씩 추가 기록."""
-    try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)      # eval 폴더가 없으면 만듦 (있으면 그냥 넘어감)
-        record["time"] = datetime.now().isoformat(timespec="seconds")  # 기록 시각 추가. 예: '2026-10-14T17:30:05'
-        with LOG_PATH.open("a", encoding="utf-8") as f:         # 파일을 '이어쓰기(a)' 모드로 열어서
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")  # 한글이 깨지지 않게 JSON 한 줄로 저장
-    except Exception:                                           # 기록에 실패해도 (권한 문제 등)
-        pass                                                    #   답변에는 영향 없도록 조용히 넘어감
+    """Keep the original QA fields alongside request events."""
+    trace = request_log.current()
+    if trace:
+        trace.emit("qa_result", **record)
+
+
+def _expand_to_pages(docs):
+    """[#37] 고른 조각을 그 조각이 속한 페이지 전체(레이아웃 보존 텍스트)로 바꿈.
+    표·목록이 600자 청크 경계에서 잘려 일부만 GPT에 전달되는 문제를 막음.
+    같은 페이지는 한 번만 넣고, 재정렬 순서를 유지하며, 전체 글자 수는 MAX_CONTEXT_CHARS를 넘지 않게 함."""
+    expanded, seen, total = [], set(), 0
+    for doc in docs:
+        key = (_source_name(doc.metadata), doc.metadata.get("page"))
+        if key in seen:
+            continue
+        seen.add(key)
+        page_text = doc.metadata.get("page_text") or doc.page_content   # 예전 DB처럼 page_text가 없으면 조각 그대로
+        if expanded and total + len(page_text) > MAX_CONTEXT_CHARS:
+            page_text = doc.page_content                                 # 상한을 넘으면 그 페이지는 원래 조각만
+            if total + len(page_text) > MAX_CONTEXT_CHARS:
+                break
+        expanded.append(Document(page_content=page_text, metadata=doc.metadata))
+        total += len(page_text)
+    return expanded
+
+
+def _log_documents(db, docs):
+    trace = request_log.current()
+    if trace:
+        trace.emit("retrieval_result", collection=getattr(db, "_collection_name", None),
+                   documents=[dict(filename=_source_name(d.metadata),
+                                   page=_page_label(d.metadata),
+                                   chunk_id=d.metadata.get("chunk_id") or getattr(d, "id", None))
+                              for d in docs])
 
 
 def _history_to_text(history):
@@ -430,6 +697,15 @@ def _history_to_text(history):
 
 
 def answer(question, openai_key, db, history=None):
+    """Stream an answer while logging one request across Gradio worker contexts."""
+    if request_log.current():
+        yield from _answer(question, openai_key, db, history)
+    else:
+        with request_log.request(LOG_PATH, "qa", secrets=(openai_key,), activate=False) as trace:
+            yield from request_log.iterate(trace, _answer(question, openai_key, db, history))
+
+
+def _answer(question, openai_key, db, history=None):
     """질문을 받아 답변을 만드는 메인 함수.
     question  : 사용자가 입력한 질문
     openai_key: 사용자가 입력한 OpenAI API 키
@@ -446,7 +722,10 @@ def answer(question, openai_key, db, history=None):
     if len(question) > MAX_QUESTION_LEN:                        # 질문이 너무 길면
         raise gr.Error(f"질문은 {MAX_QUESTION_LEN}자 이내로 입력하세요.")  # 오류 창 띄우고 멈춤
 
-    llm = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=openai_key)  # GPT 준비. temperature=0: 같은 질문엔 최대한 같은 답
+    trace = request_log.current()
+    trace.emit("qa_context", collection=getattr(db, "_collection_name", None), model=MODEL_NAME)
+    llm = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=openai_key,
+                     stream_usage=True, callbacks=[request_log.TokenUsageCallback(trace, MODEL_NAME)])
     start = time.perf_counter()                                 # [업그레이드 3] 시간 측정 시작 (스톱워치 누르기)
 
     try:                                                        # 아래에서 OpenAI 오류가 나면 맨 아래 except에서 처리
@@ -454,13 +733,15 @@ def answer(question, openai_key, db, history=None):
         history_text = _history_to_text(history)                # 대화 기록을 글로 변환
         search_question = question                              # 기본값: 사용자가 쓴 질문 그대로 검색
         if history_text:                                        # 이전 대화가 있으면
-            search_question = (CONDENSE_PROMPT | llm | StrOutputParser()).invoke(  # 프롬프트 → GPT → 글자만 꺼내기 순서로 실행
-                {"history": history_text, "question": question}  # 프롬프트의 {history}, {question} 자리에 넣을 값
-            ).strip() or question                               # 결과 앞뒤 공백 제거. 결과가 비면 원래 질문 사용
+            with request_log.stage("question_rewrite"):
+                search_question = (CONDENSE_PROMPT | llm | StrOutputParser()).invoke(
+                    {"history": history_text, "question": question}
+                ).strip() or question
 
         # ===== 3단계: [업그레이드 2] 캐시 확인 =====
         cached = _cache_get(db, search_question)                # 같은 질문에 대한 저장된 답변이 있는지 확인
         if cached:                                              # 있으면
+            trace.status = "cached"                             # [#49] 요청 로그: 캐시 응답
             _log(question=question, search_question=search_question, cached=True,
                  mode=SEARCH_MODE,
                  seconds=round(time.perf_counter() - start, 2))
@@ -468,20 +749,34 @@ def answer(question, openai_key, db, history=None):
             return                                              # 함수 끝 (검색·GPT 호출 생략 → 빠르고 비용 0)
 
         # ===== 4단계: PDF에서 관련 내용 검색 (방식은 SEARCH_MODE 설정을 따름) =====
-        docs, rerank_ok = _retrieve(db, llm, search_question)
+        try:
+            with request_log.stage("retrieval"):                # [#49] 요청 로그: 검색 단계
+                docs, rerank_ok = _retrieve(db, llm, search_question)
+        finally:
+            trace.usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
+                        stage="retrieval_embeddings")
+        with request_log.stage("selected_context"):             # [#49] 최종 선택된 조각 기록
+            _log_documents(db, docs)
+        with request_log.stage("page_context"):                 # [#37] 고른 조각을 페이지 전체로 넓힘
+            docs = _expand_to_pages(docs)
+            if trace:
+                trace.emit("page_context", pages=[_page_label(d.metadata) for d in docs],
+                           chars=sum(len(d.page_content) for d in docs))
 
         if not docs:                                            # 관련 내용을 하나도 못 찾았으면
+            trace.status = "no_results"
             yield "업로드한 문서에서 관련 내용을 찾지 못했습니다. 질문을 바꿔서 다시 시도해 보세요."  # 안내 문구 표시
             return                                              # 함수 끝
 
         # ===== 5단계: GPT로 답변 만들기 (조금씩 화면에 표시) =====
         chain = ANSWER_PROMPT | llm | StrOutputParser()         # 프롬프트 → GPT → 글자만 꺼내기를 하나로 연결
         text = ""                                               # 지금까지 받은 답변을 모아 둘 변수
-        for chunk in chain.stream(                              # stream: 답변을 한 번에 받지 않고 조각조각 받음
-            {"context": _format_docs(docs), "question": search_question}  # {context}=검색된 PDF 내용, {question}=질문
-        ):
-            text += chunk                                       # 새로 받은 조각을 이어 붙이고
-            yield text                                          # 지금까지의 답변을 화면에 갱신 (타자 치는 효과)
+        with request_log.stage("answer_generation"):
+            for chunk in chain.stream(
+                {"context": _format_docs(docs), "question": search_question}
+            ):
+                text += chunk
+                yield text
 
         # ===== 6단계: 참고 페이지 + 근거 원문 붙이기 =====
         final = (text + _format_sources(docs)                   # 완성된 답변 아래에 '참고: report.pdf (p.2, 5)' 추가
@@ -496,28 +791,38 @@ def answer(question, openai_key, db, history=None):
              pages=[_page_number(d.metadata) for d in docs])    # 답변 근거로 쓴 실제 PDF 페이지 목록
 
     # ===== 오류 처리: OpenAI 오류를 사용자가 이해할 수 있는 한국어로 안내 =====
-    except openai.AuthenticationError:                          # API 키가 틀렸거나 만료된 경우
+    except openai.AuthenticationError as error:                          # API 키가 틀렸거나 만료된 경우
+        trace.error(error)
         raise gr.Error("API 키가 올바르지 않습니다. 키를 다시 확인하세요.")
-    except openai.RateLimitError:                               # 너무 자주 요청했거나 크레딧(사용 한도)을 다 쓴 경우
+    except openai.RateLimitError as error:                               # 너무 자주 요청했거나 크레딧(사용 한도)을 다 쓴 경우
+        trace.error(error)
         raise gr.Error("OpenAI 사용 한도를 초과했습니다. 잠시 후 다시 시도하세요.")
-    except openai.APIConnectionError:                           # 인터넷 연결 문제 등으로 OpenAI 서버에 접속 못 한 경우
+    except openai.APIConnectionError as error:                           # 인터넷 연결 문제 등으로 OpenAI 서버에 접속 못 한 경우
+        trace.error(error)
         raise gr.Error("OpenAI 서버에 연결할 수 없습니다. 네트워크를 확인하세요.")
+
+
+
+
+
+
 
 
 # ===== Step 3. 화면 (feature/chat-ui) =====
 
-import os
+# os·base64·tempfile·Path(Step 1), gradio(Step 2)는 위 구역의 import를 같이 사용
 import threading
-import gradio as gr
-from pathlib import Path
+from copy import deepcopy
+
 from dotenv import load_dotenv
 
 
 # ==========================================
-# 1. 환경변수 및 세션 관리
+# 1. 환경변수 및 세션 설정
 # ==========================================
 
 load_dotenv()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 _session_dbs = {}
@@ -526,47 +831,88 @@ _sessions_guard = threading.Lock()
 
 
 # ==========================================
-# 2. CSS 디자인 + 다크모드
+# 2. 팀 로고 불러오기
+# ==========================================
+
+def get_logo_html():
+    logo_path = Path(__file__).with_name("hyundap_logo.png")
+
+    if logo_path.exists():
+        encoded = base64.b64encode(
+            logo_path.read_bytes()
+        ).decode("utf-8")
+
+        return (
+            '<img class="team-logo" '
+            f'src="data:image/png;base64,{encoded}" '
+            'alt="hyundap 로고">'
+        )
+
+    return '<span class="logo-fallback">📚</span>'
+
+
+# ==========================================
+# 3. CSS - 라이트/다크모드
 # ==========================================
 
 CSS = """
+/* =========================
+   기본 색상
+========================= */
+
 .gradio-container {
-    --page: #FFFFFF;
-    --card: #FFFFFF;
-    --field: #FFFFFF;
-    --answer: #F7F9FF;
+    --page: #ffffff;
+    --card: #ffffff;
+    --field: #ffffff;
+    --answer: #f7f9ff;
     --fg: #202638;
     --muted: #738096;
-    --line: #E3E8F1;
+    --line: #e3e8f1;
+    --chat-bg: #ffffff;
+    --assistant-bg: #ffffff;
 
     background: var(--page) !important;
     color: var(--fg) !important;
-    max-width: 720px !important;
-    margin: 0 auto !important;
-    padding: 30px 18px !important;
+
+    max-width: 760px !important;
     min-height: 100vh;
-    font-family: 'Pretendard', Arial, sans-serif !important;
+
+    margin: auto !important;
+    padding: 28px 18px !important;
+
+    font-family:
+        'Pretendard',
+        'Inter',
+        Arial,
+        sans-serif;
 }
 
 html, body {
-    background: #FFFFFF !important;
+    background: #ffffff !important;
 }
 
-/* 다크모드 */
+/* =========================
+   다크모드
+========================= */
 
 html:has(#mode-select input[type="checkbox"]:checked),
 body:has(#mode-select input[type="checkbox"]:checked) {
-    background: #11141C !important;
+    background: #11141c !important;
 }
 
-.gradio-container:has(#mode-select input[type="checkbox"]:checked) {
-    --page: #11141C;
-    --card: #1A1E2B;
-    --field: #252B3A;
-    --answer: #252B3A;
-    --fg: #F3F5FA;
-    --muted: #ACB5C8;
+.gradio-container:has(
+    #mode-select input[type="checkbox"]:checked
+) {
+    --page: #11141c;
+    --card: #1a1e2b;
+    --field: #252b3a;
+    --answer: #252b3a;
+    --fg: #f3f5fa;
+    --muted: #acb5c8;
     --line: #394256;
+    --chat-bg: #1a1e2b;
+    --assistant-bg: #303749;
+
     color-scheme: dark;
 }
 
@@ -574,33 +920,65 @@ footer {
     display: none !important;
 }
 
-/* 메인 카드 */
+/* =========================
+   메인 카드
+========================= */
 
 #main-card {
     background: var(--card) !important;
     color: var(--fg) !important;
+
     border: 1px solid var(--line) !important;
     border-radius: 20px !important;
-    padding: 24px !important;
-    box-shadow: 0 10px 30px rgba(40,60,100,.05);
-    gap: 14px !important;
+
+    padding: 22px !important;
+    gap: 12px !important;
+
+    box-shadow:
+        0 10px 30px rgba(40, 60, 100, .05);
 }
 
-/* 제목 */
+/* =========================
+   상단 로고 + 제목
+========================= */
 
 #title-row {
     align-items: center !important;
+    flex-wrap: nowrap !important;
+    gap: 8px !important;
+}
+
+.brand-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.team-logo {
+    width: 36px;
+    height: 36px;
+    object-fit: contain;
+    border-radius: 5px;
+    flex-shrink: 0;
+}
+
+.logo-fallback {
+    font-size: 27px;
 }
 
 .page-title {
-    font-size: 21px;
+    font-size: 18px;
     font-weight: 800;
     color: var(--fg);
     margin: 0;
+    white-space: nowrap;
+    letter-spacing: -0.6px;
     line-height: 1.4;
+    word-break: keep-all;   /* 한글 단어 중간에서 줄바꿈하지 않음 (#40) */
 }
 
-/* 다크모드 체크박스 */
+/* 다크모드 */
 
 #mode-select {
     background: transparent !important;
@@ -612,47 +990,58 @@ footer {
 #mode-select label,
 #mode-select span {
     color: var(--fg) !important;
-    font-size: 13px !important;
+    font-size: 12px !important;
+    white-space: nowrap !important;
 }
 
-/* 그라데이션 구분선 */
+/* =========================
+   그라데이션 구분선
+========================= */
 
 .gradient-line {
     width: 100%;
     height: 3px;
     border-radius: 99px;
-    background: linear-gradient(
-        90deg, #329AFF, #8578FF, #FF65AF
-    );
-    margin: 3px 0 9px;
-}
 
-/* 영역 제목 */
+    background: linear-gradient(
+        90deg,
+        #329aff,
+        #8578ff,
+        #ff65af
+    );
+
+    margin: 4px 0 10px;
+}
 
 .section-label {
     font-size: 14px;
     font-weight: 700;
     color: var(--fg);
-    margin: 0 0 5px;
+    margin-bottom: 5px;
 }
 
-/* PDF 업로드 */
+/* =========================
+   PDF 파일 업로드
+========================= */
 
 #file-row {
     align-items: stretch !important;
+    flex-wrap: nowrap !important;
     gap: 10px !important;
 }
 
 #pdf-select {
-    border-radius: 11px !important;
     background: var(--field) !important;
     color: var(--fg) !important;
+
     border: 1px solid var(--line) !important;
-    min-height: 45px !important;
-    box-shadow: none !important;
+    border-radius: 11px !important;
+
+    min-height: 44px !important;
+    font-size: 13px !important;
+    white-space: nowrap !important;
 }
 
-#pdf-select,
 #pdf-select * {
     color: var(--fg) !important;
 }
@@ -660,10 +1049,32 @@ footer {
 #upload-btn {
     background: var(--answer) !important;
     color: var(--fg) !important;
+
     border: 1px solid var(--line) !important;
     border-radius: 11px !important;
-    min-height: 45px !important;
+
+    min-height: 44px !important;
+    min-width: 120px !important;
+
+    font-size: 12px !important;
+    font-weight: 700 !important;
+    white-space: nowrap !important;
 }
+
+/* 질문창 안내 문구도 단어 단위로 줄바꿈 (#40) */
+#question-box textarea {
+    word-break: keep-all;
+}
+
+/* 버튼 글자는 한 줄로 표시 (#40) */
+#pdf-select,
+#upload-btn,
+#reset-select-btn {
+    white-space: nowrap !important;
+    word-break: keep-all !important;
+}
+
+/* 업로드 상태 */
 
 #upload-status,
 #upload-status * {
@@ -671,29 +1082,165 @@ footer {
     font-size: 12px !important;
 }
 
-/* 질문 입력창 */
+/* =========================
+   PDF 목록
+========================= */
+
+#document-accordion {
+    background: var(--answer) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+}
+
+#document-accordion,
+#document-accordion * {
+    color: var(--fg) !important;
+}
+
+#document-list {
+    padding: 5px 8px !important;
+}
+
+#document-list,
+#document-list * {
+    color: var(--fg) !important;
+    font-size: 13px !important;
+    overflow-wrap: anywhere;
+}
+
+/* =========================
+   통합 채팅 카드
+========================= */
+
+#chat-panel {
+    background: var(--card) !important;
+
+    border: 1px solid var(--line) !important;
+    border-radius: 16px !important;
+
+    padding: 12px !important;
+    gap: 10px !important;
+}
+
+.chat-heading {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--fg);
+}
+
+/* =========================
+   채팅창 라이트/다크 색상
+========================= */
+
+#chat-box {
+    background: var(--chat-bg) !important;
+    border: none !important;
+    border-radius: 12px !important;
+
+    --background-fill-primary: var(--chat-bg);
+    --background-fill-secondary: var(--chat-bg);
+    --body-background-fill: var(--chat-bg);
+    --block-background-fill: var(--chat-bg);
+    --block-border-color: transparent;
+    --body-text-color: var(--fg);
+    --button-secondary-background-fill: var(--field);
+    --button-secondary-text-color: var(--fg);
+}
+
+#chat-box .bubble-wrap,
+#chat-box .message-wrap,
+#chat-box .chatbot,
+#chat-box .messages,
+#chat-box .scroll-hide,
+#chat-box .scrollable {
+    background: var(--chat-bg) !important;
+}
+
+/* 사용자 말풍선 */
+
+#chat-box .message.user,
+#chat-box .message.user.message {
+    background: #6478ed !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 16px !important;
+}
+
+#chat-box .message.user * {
+    color: #ffffff !important;
+}
+
+/* AI 답변 말풍선 */
+
+#chat-box .message.bot,
+#chat-box .message.assistant {
+    background: var(--assistant-bg) !important;
+    color: var(--fg) !important;
+
+    border: 1px solid var(--line) !important;
+    border-radius: 16px !important;
+}
+
+#chat-box .message.bot *,
+#chat-box .message.assistant * {
+    color: var(--fg) !important;
+}
+
+/* 채팅창 아이콘(대화 지우기·복사)이 라이트 모드에서 흰색으로 안 보이던 문제 */
+#chat-box .icon-button-wrapper,
+#chat-box .icon-button-wrapper button {
+    background: var(--field) !important;
+}
+
+#chat-box .icon-button-wrapper button,
+#chat-box .icon-button-wrapper button *,
+#chat-box .icon-button-wrapper svg,
+#chat-box .icon-button-wrapper svg * {
+    color: var(--fg) !important;
+    stroke: var(--fg) !important;
+}
+
+/* =========================
+   질문 입력창
+========================= */
+
+#input-row {
+    align-items: stretch !important;
+    gap: 8px !important;
+}
+
+#reset-select-btn {
+    align-self: flex-start !important;
+    width: auto !important;
+    min-width: 0 !important;
+    background: var(--field) !important;
+    color: var(--muted) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 9px !important;
+    box-shadow: none !important;
+}
 
 #question-box {
     background: var(--field) !important;
     border: 1px solid var(--line) !important;
     border-radius: 12px !important;
-    overflow: hidden !important;
-    box-shadow: none !important;
+
     padding: 0 !important;
+    box-shadow: none !important;
+    overflow: hidden !important;
 }
 
 #question-box textarea {
-    display: block !important;
     background: transparent !important;
     color: var(--fg) !important;
+
     border: none !important;
     outline: none !important;
     box-shadow: none !important;
-    border-radius: 12px !important;
-    padding: 14px !important;
+
+    padding: 12px !important;
     font-size: 14px !important;
-    line-height: 1.6 !important;
-    min-height: 60px !important;
+    min-height: 48px !important;
 }
 
 #question-box textarea::placeholder {
@@ -701,95 +1248,234 @@ footer {
 }
 
 #question-box:focus-within {
-    border-color: #827AFF !important;
+    border-color: #827aff !important;
 }
 
-/* 질문하기 버튼 */
+/* 전송 버튼 */
 
-#ask-btn {
+#send-btn {
     background: linear-gradient(
-        110deg,
-        #329AFF 0%,
-        #827AFF 50%,
-        #FF65AF 100%
+        135deg,
+        #329aff,
+        #827aff,
+        #ff65af
     ) !important;
+
+    color: #ffffff !important;
     border: none !important;
-    color: #FFFFFF !important;
     border-radius: 12px !important;
-    min-height: 47px !important;
-    font-size: 14px !important;
-    font-weight: 750 !important;
-    box-shadow: 0 5px 14px rgba(130,122,255,.15);
+
+    min-height: 48px !important;
+    font-size: 18px !important;
+    font-weight: 800 !important;
 }
 
-#ask-btn:hover {
-    filter: brightness(1.06);
+/* =========================
+   대화 초기화 + 이전 기록
+========================= */
+
+#history-row {
+    align-items: stretch !important;
+    flex-wrap: nowrap !important;
+    gap: 10px !important;
 }
 
-/* 채팅 영역 */
-
-#chat-box {
-    background: var(--answer) !important;
-    border: 1px solid var(--line) !important;
-    border-left: 4px solid #827AFF !important;
-    border-radius: 12px !important;
-    box-shadow: none !important;
+/* 질문할 수 없는 상태(PDF 미등록·처리 중·등록 실패)를 눈에 띄게 표시 (#55) */
+#question-box:has(textarea:disabled) {
+    border-style: dashed !important;
+    border-color: var(--muted) !important;
 }
 
-#chat-box .message {
-    border: 1px solid var(--line) !important;
+#question-box textarea:disabled::placeholder {
+    color: var(--muted) !important;
+    opacity: 1 !important;
 }
 
-#chat-box .message.user {
-    background: var(--field) !important;
+#question-box textarea:disabled {
+    cursor: not-allowed !important;
 }
 
-#chat-box .message.bot,
-#chat-box .message.assistant {
-    background: var(--card) !important;
-}
-
-#chat-box,
-#chat-box * {
+#send-btn:disabled,
+#send-btn[disabled] {
+    background: var(--line) !important;
     color: var(--fg) !important;
+    opacity: 0.85 !important;
+    box-shadow: none !important;
+    filter: none !important;
+    cursor: not-allowed !important;
 }
-
-/* 초기화 버튼 */
 
 #clear-btn {
-    background: var(--answer) !important;
-    color: var(--fg) !important;
+    height: 48px !important;
+    min-height: 48px !important;
+
     border: 1px solid var(--line) !important;
     border-radius: 12px !important;
-    min-height: 40px !important;
+
+    background: var(--field) !important;
+    color: var(--fg) !important;
+
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
     box-shadow: none !important;
 }
 
-/* 모바일 */
+#history-menu {
+    height: 48px !important;
+    min-height: 48px !important;
+
+    padding: 0 !important;
+    background: var(--field) !important;
+    color: var(--fg) !important;
+
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+
+    box-shadow: none !important;
+    overflow: hidden !important;
+}
+
+#history-menu .wrap {
+    height: 100% !important;
+    min-height: 0 !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+
+#history-menu input {
+    background: transparent !important;
+    color: var(--fg) !important;
+    font-size: 13px !important;
+}
+
+#history-menu label,
+#history-menu span {
+    color: var(--fg) !important;
+    font-size: 13px !important;
+}
+
+/* =========================
+   TXT 다운로드
+========================= */
+
+#download-btn {
+    min-height: 44px !important;
+
+    background: var(--field) !important;
+    color: var(--fg) !important;
+
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+
+    font-size: 13px !important;
+    font-weight: 600 !important;
+}
+
+#download-file {
+    background: var(--answer) !important;
+    color: var(--fg) !important;
+}
+
+/* =========================
+   모바일 대응
+========================= */
 
 @media (max-width: 600px) {
     .gradio-container {
-        padding: 12px 8px !important;
+        padding: 10px 6px !important;
     }
 
     #main-card {
-        padding: 16px !important;
-        border-radius: 16px !important;
+        padding: 14px !important;
     }
 
     .page-title {
-        font-size: 18px;
+        font-size: clamp(12px, 3vw, 17px);
     }
 
-    #file-row {
-        flex-wrap: nowrap !important;
+    .team-logo {
+        width: 27px;
+        height: 27px;
+    }
+
+    #file-row,
+    #history-row {
+        gap: 6px !important;
+    }
+
+    #pdf-select {
+        min-width: 0 !important;
+        font-size: 11px !important;
+    }
+
+    #upload-btn {
+        min-width: 100px !important;
+        font-size: 11px !important;
+    }
+
+    #clear-btn,
+    #history-menu input {
+        font-size: 11px !important;
+    }
+
+    /* 좁은 화면에서는 버튼 글자·여백·최소 폭을 줄여 한 줄 유지, 카드 밖으로 넘치지 않게 (#40) */
+    #pdf-select,
+    #upload-btn {
+        font-size: 13px !important;
+        padding-left: 8px !important;
+        padding-right: 8px !important;
+        min-width: 0 !important;
+    }
+}
+
+/* 아주 좁은 폰(400px 이하): 카드 안쪽 여백 축소 (#40) */
+@media (max-width: 400px) {
+    #main-card {
+        padding: 14px 12px !important;
+    }
+}
+
+/* 320px: 제목 줄이 넘쳐 다크모드 토글이 카드 밖으로 잘리던 문제 */
+@media (max-width: 360px) {
+    #title-row {
+        flex-wrap: wrap !important;
+    }
+
+    #title-row > * {
+        min-width: 0 !important;
+    }
+
+    .page-title {
+        white-space: normal;
+        font-size: 15px;
+    }
+
+    #mode-select {
+        max-width: 100% !important;
     }
 }
 """
 
+# Gradio는 css= 규칙 앞에 '.gradio-container ... .contain'을 자동으로 붙여서
+# 카드 바깥 요소(.main)에는 적용되지 않음 → head로 전역 스타일을 넣어
+# 아주 좁은 폰에서 Gradio 기본 좌우 여백(32px)을 없앰 (#40)
+HEAD_STYLE = """
+<style>
+@media (max-width: 400px) {
+    .gradio-container .main,
+    .gradio-container .fillable {
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+    }
+}
+</style>
+"""
+
 
 # ==========================================
-# 3. 세션 및 DB 관리 함수
+# 4. DB 세션 관리
 # ==========================================
 
 def _session_lock(request):
@@ -804,54 +1490,89 @@ def _delete_db(db):
     if db is None:
         return
 
+    _cache_clear(db)
+
     try:
         db.delete_collection()
-    except Exception:
-        logging.getLogger(__name__).exception("Chroma 컬렉션 삭제 실패")
+    except Exception as error:
+        trace = request_log.current()
+        if trace:
+            trace.error(error, cleanup=True)
+        else:
+            with request_log.request(LOG_PATH, "db_cleanup", secrets=(OPENAI_API_KEY,)) as trace:
+                trace.status = "error"
+                trace.error(error)
+        logging.getLogger(__name__).error("Chroma 컬렉션 삭제 실패: %s", trace.redact(str(error)))
 
 
 # ==========================================
-# 4. PDF 다중 업로드
+# 5. 다중 PDF 업로드
 # ==========================================
 
-def select_pdf(files):
+def _selection_status(paths):
+    if not paths:
+        return "📁 선택한 PDF가 없습니다."
 
+    return (
+        f"✅ 총 {len(paths)}개 PDF 선택 완료\n\n"
+        + "\n".join(
+            f"- 📄 {Path(path).name}"
+            for path in paths
+        )
+        + "\n\n다시 선택하면 목록에 추가됩니다. 비우려면 '선택 초기화'를 누르세요."
+    )
+
+
+def select_pdf(files, current_paths=None):
+    # 다시 선택하면 기존 목록에 추가 (#41). 같은 이름의 파일은 새로 고른 것으로 교체
     if not files:
-        return None, "📎 PDF 파일을 선택해주세요."
+        return current_paths, _selection_status(current_paths)
 
     if not isinstance(files, list):
         files = [files]
 
-    paths = [
-        f if isinstance(f, str) else f.name
-        for f in files
-    ]
+    selected = {
+        Path(path).name: path
+        for path in (current_paths or [])
+    }
 
-    filenames = [Path(path).name for path in paths]
+    for f in files:
+        path = f if isinstance(f, str) else f.name
+        selected[Path(path).name] = path
 
-    status = (
-        f"✅ 총 {len(paths)}개 PDF 선택 완료\n\n"
-        + "\n".join(
-            f"- 📄 {name}"
-            for name in filenames
-        )
-    )
+    paths = list(selected.values())
 
-    return paths, status
+    return paths, _selection_status(paths)
 
+
+def clear_selection():
+    # 선택한 PDF 목록 비우기 (#41). 이미 등록된 DB는 그대로 두고 다음 등록 대상만 초기화
+    return None, _selection_status(None)
+
+
+# 질문창 안내 문구: 질문할 수 없는 이유를 상태별로 보여줌 (#55)
+QUESTION_READY = "💬 여러 PDF 문서에 대해 질문하세요..."
+QUESTION_NO_PDF = "🔒 먼저 PDF를 선택하고 '파일 등록'을 눌러야 질문할 수 있습니다."
+QUESTION_PROCESSING = "⏳ PDF 처리 중입니다. 완료되면 질문할 수 있습니다."
+QUESTION_NOT_REGISTERED = "🔒 등록된 PDF가 없어 질문할 수 없습니다. 위 안내를 확인하고 PDF를 다시 등록해 주세요."
+REGISTER_FAILED_NOTE = "\n\n🔒 PDF 등록에 성공해야 질문할 수 있습니다."
 
 def start_register(request: gr.Request):
 
     with _session_lock(request):
         _delete_db(
-            _session_dbs.pop(request.session_hash, None)
+            _session_dbs.pop(
+                request.session_hash,
+                None
+            )
         )
 
     locked = gr.update(interactive=False)
 
     return (
         None,
-        "⏳ PDF 처리 중입니다... 완료 후 질문할 수 있습니다.",
+        QUESTION_PROCESSING,
+        gr.update(interactive=False, placeholder=QUESTION_PROCESSING),
         locked,
         locked,
         locked,
@@ -862,46 +1583,92 @@ def start_register(request: gr.Request):
 def register_pdf(pdf_paths, request: gr.Request):
 
     if not pdf_paths:
-        return None, "⚠️ PDF 파일을 선택해주세요."
+        with request_log.request(LOG_PATH, "pdf_registration", secrets=(OPENAI_API_KEY,)) as trace:
+            trace.status = "empty"
+        return None, "⚠️ PDF 파일을 선택해주세요." + REGISTER_FAILED_NOTE
 
     if not OPENAI_API_KEY:
+        with request_log.request(LOG_PATH, "pdf_registration") as trace:
+            trace.status = "error"
+            trace.emit("validation_failed", reason="missing_api_key")
         return (
             None,
-            "⚠️ OPENAI_API_KEY가 없습니다. .env 파일을 확인해주세요."
+            "⚠️ OPENAI_API_KEY가 없습니다. .env 파일을 확인해주세요." + REGISTER_FAILED_NOTE
         )
 
-    # 여러 PDF를 하나의 DB로 처리
-    db, message = build_db(pdf_paths, OPENAI_API_KEY)
+    # Step 1의 기존 다중 PDF 처리 함수
+    db, message = build_db(
+        pdf_paths,
+        OPENAI_API_KEY
+    )
 
     if db is not None:
         with _session_lock(request):
             _session_dbs[request.session_hash] = db
+    else:
+        message += REGISTER_FAILED_NOTE                          # 질문이 막힌 이유 안내 (#55)
 
     return db, message
 
 
-def finish_register(db):
+def _registered_names(db, pdf_paths):
+    # 일부 PDF가 제외돼도(#42) 실제로 등록된 파일만 목록에 보이도록 DB 메타데이터에서 읽음
+    try:
+        metadatas = db.get(include=["metadatas"])["metadatas"]
+        names = {
+            meta["source_filename"]
+            for meta in metadatas
+            if meta and meta.get("source_filename")
+        }
+        if names:
+            return sorted(names)
+    except Exception:
+        pass
 
-    can_ask = gr.update(interactive=db is not None)
+    return [Path(path).name for path in (pdf_paths or [])]
+
+
+def finish_register(db, message, pdf_paths):
+    # 결과 문구와 질문창 활성화를 한 번에 바꿔 '완료됐는데 못 쓰는' 순간이 없게 함 (#55)
+    can_ask = db is not None
+    placeholder = QUESTION_READY if can_ask else QUESTION_NOT_REGISTERED
+
+    if can_ask:
+        document_text = "\n".join(
+            f"- 📄 {name}"
+            for name in _registered_names(db, pdf_paths)
+        )
+    else:
+        document_text = "📁 등록된 문서가 없습니다."
 
     return (
-        can_ask,
-        can_ask,
+        message,
+        gr.update(interactive=can_ask, placeholder=placeholder),
+        gr.update(interactive=can_ask),
         gr.update(interactive=True),
-        gr.update(interactive=True)
+        gr.update(interactive=True),
+        gr.update(interactive=True),
+        document_text
     )
 
 
 # ==========================================
-# 5. 질문 및 스트리밍 답변
+# 6. 질문 및 스트리밍 답변
 # ==========================================
 
 def ask_question(question, history, db, request: gr.Request):
+    with request_log.request(LOG_PATH, "qa", secrets=(OPENAI_API_KEY,), activate=False) as trace:
+        yield from request_log.iterate(trace, _ask_question(question, history, db, request))
+
+
+def _ask_question(question, history, db, request):
 
     history = list(history or [])
-    prior_history = list(history)
+    prior_history = deepcopy(history)
 
     if not question or not question.strip():
+        request_log.current().status = "error"
+        request_log.current().emit("validation_failed", reason="empty_question")
         history.append({
             "role": "assistant",
             "content": "⚠️ 질문을 입력해주세요."
@@ -911,28 +1678,32 @@ def ask_question(question, history, db, request: gr.Request):
 
     history.append({
         "role": "user",
-        "content": question
+        "content": question.strip()
     })
 
     with _session_lock(request):
 
         if db is None or db is not _session_dbs.get(request.session_hash):
+            request_log.current().status = "error"
+            request_log.current().emit("validation_failed", reason="missing_or_replaced_db")
             history.append({
                 "role": "assistant",
-                "content": "⚠️ PDF를 선택한 뒤 파일 등록 버튼을 눌러주세요."
+                "content": "⚠️ 먼저 PDF 파일을 등록해주세요."
             })
+
             yield history, ""
             return
 
         history.append({
             "role": "assistant",
-            "content": "🤖 답변을 생성하는 중..."
+            "content": "답변을 생성하는 중..."
         })
+
         yield history, ""
 
         try:
             result = answer(
-                question,
+                question.strip(),
                 OPENAI_API_KEY,
                 db,
                 prior_history
@@ -947,48 +1718,227 @@ def ask_question(question, history, db, request: gr.Request):
                     history[-1]["content"] = str(text)
                     yield history, ""
 
+        except gr.Error:
+            raise
+
         except Exception as e:
+            request_log.current().status = "error"
+            request_log.current().error(e)
             history[-1]["content"] = f"⚠️ 답변 처리 오류: {e}"
             yield history, ""
 
 
-def clear_chat():
-    return []
+# ==========================================
+# 7. 이전 대화 기록
+# ==========================================
 
+HISTORY_DEFAULT = "__history_default__"
+
+
+def history_choices(archives):
+
+    choices = [
+        ("📜 이전 기록", HISTORY_DEFAULT)
+    ]
+
+    for item in reversed(archives or []):
+        choices.append(
+            (item["title"], item["id"])
+        )
+
+    return choices
+
+
+def _message_text(content):
+    """Gradio 6 Chatbot은 content를 [{'text': ..., 'type': 'text'}] 목록으로 넘기므로 글자만 꺼냄."""
+    if isinstance(content, list):
+        return " ".join(
+            c.get("text", "") for c in content if isinstance(c, dict)
+        )
+    return str(content or "")
+
+
+def archive_and_clear(history, archives, restored_id=None):
+
+    archives = deepcopy(archives or [])
+    history = deepcopy(history or [])
+
+    # 복원한 기록을 고치지 않고 그대로 다시 초기화하면 새로 보관하지 않음
+    already_archived = any(
+        item["id"] == restored_id and item["messages"] == history
+        for item in archives
+    )
+
+    if history and not already_archived:
+
+        first_question = next(
+            (
+                _message_text(msg.get("content", ""))
+                for msg in history
+                if msg.get("role") == "user"
+            ),
+            "이전 대화"
+        )
+
+        title = first_question.replace(
+            "\n", " "
+        ).strip()
+
+        if len(title) > 24:
+            title = title[:24] + "..."
+
+        record_id = str(
+            max(
+                (
+                    int(item["id"])
+                    for item in archives
+                ),
+                default=0
+            ) + 1
+        )
+
+        archives.append({
+            "id": record_id,
+            "title": f"💬 {title or '이전 대화'}",
+            "messages": history
+        })
+
+    return (
+        [],
+        "",
+        archives,
+        gr.update(
+            choices=history_choices(archives),
+            value=HISTORY_DEFAULT
+        ),
+        None,
+        gr.update(value=None, visible=False)
+    )
+
+
+def restore_history(record_id, archives):
+
+    if record_id == HISTORY_DEFAULT:
+        return gr.skip(), "", gr.skip()
+
+    for item in archives or []:
+
+        if item["id"] == record_id:
+            return deepcopy(item["messages"]), "", record_id
+
+    return gr.skip(), "", gr.skip()
+
+
+# ==========================================
+# 8. TXT 대화 다운로드
+# ==========================================
+
+def create_chat_txt(history):
+
+    if not history:
+        raise gr.Error("다운로드할 대화가 없습니다.")
+
+    lines = [
+        "문서 질의응답 서비스 - 대화 기록",
+        "=" * 35,
+        ""
+    ]
+
+    for message in history:
+
+        role = message.get("role", "")
+
+        if role not in ("user", "assistant"):
+            continue
+
+        content = _message_text(
+            message.get("content", "")
+        )
+
+        lines.append(
+            "[질문]" if role == "user"
+            else "[AI 답변]"
+        )
+
+        lines.append(content)
+        lines.append("")
+        lines.append("-" * 35)
+        lines.append("")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8-sig",
+        suffix=".txt",
+        prefix="chatpdf_",
+        delete=False
+    ) as file:
+
+        file.write("\n".join(lines))
+        return file.name
+
+
+# ==========================================
+# 9. 세션 정리
+# ==========================================
 
 def cleanup_session(request: gr.Request):
 
     with _session_lock(request):
         _delete_db(
-            _session_dbs.pop(request.session_hash, None)
+            _session_dbs.pop(
+                request.session_hash,
+                None
+            )
         )
 
     with _sessions_guard:
-        _session_locks.pop(request.session_hash, None)
+        _session_locks.pop(
+            request.session_hash,
+            None
+        )
 
 
 # ==========================================
-# 6. Gradio Blocks UI
+# 10. Gradio UI
 # ==========================================
 
-with gr.Blocks(title="문서 질의응답 서비스") as demo:
+with gr.Blocks(
+    title="문서 질의응답 서비스"
+) as demo:
 
     db_state = gr.State(value=None)
     selected_files = gr.State(value=None)
+    archived_chats = gr.State(value=[])
+    restored_id = gr.State(value=None)
+    register_message = gr.State(value="")
 
     with gr.Column(elem_id="main-card"):
 
-        # 제목 + 다크모드
+        # ==============================
+        # 상단 제목 + 팀 로고
+        # ==============================
+
         with gr.Row(elem_id="title-row"):
 
-            with gr.Column(scale=5, min_width=180):
-                gr.HTML("""
-                <div class="page-title">
-                    📚 문서 질의응답 서비스
+            with gr.Column(
+                scale=6,
+                min_width=210
+            ):
+
+                gr.HTML(f"""
+                <div class="brand-header">
+                    {get_logo_html()}
+                    <div class="page-title">
+                        문서 질의응답 서비스
+                    </div>
                 </div>
                 """)
 
-            with gr.Column(scale=1, min_width=110):
+            with gr.Column(
+                scale=1,
+                min_width=100
+            ):
+
                 dark_mode = gr.Checkbox(
                     label="🌙 다크모드",
                     value=False,
@@ -996,11 +1946,18 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
                     elem_id="mode-select"
                 )
 
-        gr.HTML('<div class="gradient-line"></div>')
-
-        # PDF 다중 업로드
         gr.HTML(
-            '<div class="section-label">📚 PDF 다중 문서 업로드</div>'
+            '<div class="gradient-line"></div>'
+        )
+
+        # ==============================
+        # 다중 PDF 업로드
+        # ==============================
+
+        gr.HTML(
+            '<div class="section-label">'
+            '📚 PDF 다중 문서 업로드'
+            '</div>'
         )
 
         with gr.Row(elem_id="file-row"):
@@ -1012,7 +1969,7 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
                 type="filepath",
                 variant="secondary",
                 scale=5,
-                min_width=160,
+                min_width=130,
                 elem_id="pdf-select"
             )
 
@@ -1020,118 +1977,255 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
                 "📂 파일 등록",
                 variant="secondary",
                 scale=2,
-                min_width=95,
+                min_width=120,
                 elem_id="upload-btn"
             )
 
         status = gr.Markdown(
-            "📁 등록된 문서가 없습니다.",
+            "📁 등록된 문서가 없습니다. PDF를 선택하고 '파일 등록'을 누르면 질문할 수 있습니다.",
             elem_id="upload-status"
         )
 
-        # 질문
-        gr.HTML(
-            '<div class="section-label">💬 질문</div>'
-        )
-
-        question = gr.Textbox(
-            placeholder="💬 여러 PDF 문서에 대해 질문하세요...",
-            show_label=False,
-            container=False,
-            lines=1,
-            max_lines=5,
-            interactive=False,
-            elem_id="question-box"
-        )
-
-        ask_btn = gr.Button(
-            "🚀 질문하기 →",
-            variant="primary",
-            interactive=False,
-            elem_id="ask-btn"
-        )
-
-        # AI 대화
-        gr.HTML(
-            '<div class="section-label">✨ AI 대화</div>'
-        )
-
-        chatbot = gr.Chatbot(
-            placeholder="🤖 질문을 입력하면 이곳에 대화가 쌓입니다.",
-            show_label=False,
-            layout="bubble",
-            height=400,
-            elem_id="chat-box"
-        )
-
-        # 대화 초기화
-        clear_btn = gr.Button(
-            "🗑️ 대화 초기화",
+        reset_select_btn = gr.Button(
+            "🧹 선택 초기화",
             variant="secondary",
-            elem_id="clear-btn"
+            size="sm",
+            elem_id="reset-select-btn"
+        )
+
+        # PDF 목록
+        with gr.Accordion(
+            label="📄 등록된 PDF 목록",
+            open=False,
+            elem_id="document-accordion"
+        ):
+
+            document_list = gr.Markdown(
+                "등록된 문서가 없습니다.",
+                elem_id="document-list"
+            )
+
+        # ==============================
+        # 통합 채팅창
+        # ==============================
+
+        with gr.Column(elem_id="chat-panel"):
+
+            gr.HTML("""
+            <div class="chat-heading">
+                💬 AI 대화
+            </div>
+            """)
+
+            chatbot = gr.Chatbot(
+                value=[],
+                show_label=False,
+                layout="bubble",
+                height=360,
+                buttons=["copy"],
+                elem_id="chat-box"
+            )
+
+            # 하단 질문 입력
+            with gr.Row(elem_id="input-row"):
+
+                question = gr.Textbox(
+                    placeholder=QUESTION_NO_PDF,
+                    show_label=False,
+                    container=False,
+                    lines=1,
+                    max_lines=4,
+                    interactive=False,
+                    scale=8,
+                    min_width=150,
+                    elem_id="question-box"
+                )
+
+                send_btn = gr.Button(
+                    "➤",
+                    variant="primary",
+                    interactive=False,
+                    scale=1,
+                    min_width=55,
+                    elem_id="send-btn"
+                )
+
+        # ==============================
+        # 대화 초기화 + 이전 기록
+        # ==============================
+
+        with gr.Row(elem_id="history-row"):
+
+            clear_btn = gr.Button(
+                "🗑️ 대화 초기화",
+                variant="secondary",
+                scale=1,
+                min_width=130,
+                elem_id="clear-btn"
+            )
+
+            history_menu = gr.Dropdown(
+                choices=[
+                    (
+                        "📜 이전 기록",
+                        HISTORY_DEFAULT
+                    )
+                ],
+                value=HISTORY_DEFAULT,
+                show_label=False,
+                container=False,
+                interactive=True,
+                scale=1,
+                min_width=130,
+                elem_id="history-menu"
+            )
+
+        # ==============================
+        # 대화 TXT 다운로드
+        # ==============================
+
+        download_btn = gr.Button(
+            "📥 현재 대화 TXT 다운로드",
+            variant="secondary",
+            elem_id="download-btn"
+        )
+
+        download_file = gr.File(
+            label="생성된 대화 파일",
+            interactive=False,
+            visible=False,
+            elem_id="download-file"
         )
 
     # ======================================
-    # 7. 이벤트 핸들러
+    # 11. 이벤트 핸들러
     # ======================================
 
+    # 다중 PDF 선택
     pdf_file.upload(
         fn=select_pdf,
-        inputs=[pdf_file],
+        inputs=[pdf_file, selected_files],
         outputs=[selected_files, status]
     )
 
+    reset_select_btn.click(
+        fn=clear_selection,
+        outputs=[selected_files, status]
+    )
+
+    # PDF 처리 시작
     upload_btn.click(
         fn=start_register,
         outputs=[
             db_state,
             status,
             question,
-            ask_btn,
+            send_btn,
             pdf_file,
-            upload_btn
+            upload_btn,
+            reset_select_btn
         ]
     ).then(
         fn=register_pdf,
         inputs=[selected_files],
-        outputs=[db_state, status]
+        outputs=[db_state, register_message]
     ).then(
         fn=finish_register,
-        inputs=[db_state],
+        inputs=[db_state, register_message, selected_files],
         outputs=[
+            status,
             question,
-            ask_btn,
+            send_btn,
             pdf_file,
-            upload_btn
+            upload_btn,
+            reset_select_btn,
+            document_list
         ]
     )
 
-    ask_btn.click(
+    # 질문하기
+    send_btn.click(
         fn=ask_question,
-        inputs=[question, chatbot, db_state],
-        outputs=[chatbot, question]
+        inputs=[
+            question,
+            chatbot,
+            db_state
+        ],
+        outputs=[
+            chatbot,
+            question
+        ]
     )
 
+    # Enter 전송
     question.submit(
         fn=ask_question,
-        inputs=[question, chatbot, db_state],
-        outputs=[chatbot, question]
+        inputs=[
+            question,
+            chatbot,
+            db_state
+        ],
+        outputs=[
+            chatbot,
+            question
+        ]
     )
 
+    # 이전 대화 보관 및 초기화
     clear_btn.click(
-        fn=clear_chat,
-        outputs=chatbot
+        fn=archive_and_clear,
+        inputs=[
+            chatbot,
+            archived_chats,
+            restored_id
+        ],
+        outputs=[
+            chatbot,
+            question,
+            archived_chats,
+            history_menu,
+            restored_id,
+            download_file
+        ]
     )
 
+    # 이전 대화 불러오기
+    history_menu.change(
+        fn=restore_history,
+        inputs=[
+            history_menu,
+            archived_chats
+        ],
+        outputs=[
+            chatbot,
+            question,
+            restored_id
+        ]
+    )
+
+    # 현재 대화 TXT 파일 생성
+    download_btn.click(
+        fn=create_chat_txt,
+        inputs=[chatbot],
+        outputs=[download_file]
+    ).then(
+        fn=lambda: gr.update(visible=True),
+        outputs=[download_file]
+    )
+
+    # 세션 종료
     demo.unload(cleanup_session)
 
 
 # ==========================================
-# 8. 서버 실행
+# 12. 서버 실행
 # ==========================================
 
 if __name__ == "__main__":
+
     demo.launch(
         css=CSS,
+        head=HEAD_STYLE,
         theme=gr.themes.Soft()
     )
+

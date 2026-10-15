@@ -15,7 +15,6 @@ def process_pdf_with_params(pdf_path: str, chunk_size: int, chunk_overlap: int):
     """지정된 chunk_size 및 chunk_overlap으로 문서를 분할하고 벡터 DB를 생성합니다."""
     loader = PyPDFLoader(pdf_path)
     pages = loader.load()
-
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,

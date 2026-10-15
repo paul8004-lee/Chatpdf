@@ -27,6 +27,8 @@ echo "OPENAI_API_KEY=sk-..." > .env
 python app.py
 ```
 
+표·이미지 GPT 요약(업로드 시 표·이미지마다 GPT 호출)을 끄려면 `.env`에 `VISUAL_CHUNKS=0`을 추가합니다. 기본은 사용이며, 요약은 4개씩 동시에 실행합니다.
+
 ## 해결하려는 문제와 대상 사용자
 
 ### 1. 해결하려는 문제 (PDF 데이터 처리 및 청킹 관점)
@@ -66,7 +68,7 @@ python app.py
 
 `build_db(pdf_paths, openai_key)`는 파일 경로 목록을 받아 `(db, status)`를 반환합니다. 단일 경로도 호환됩니다. 모든 PDF의 청크를 하나의 새 Chroma 컬렉션에 저장하며, 완료 메시지에 파일·전체 페이지·전체 청크 수를 포함합니다.
 
-청크의 `source_filename`은 원본 파일명이며, `source`와 0부터 시작하는 `page` 등 로더 메타데이터는 유지됩니다. 파일 로딩·분할·저장 실패 시 실패한 파일명이 포함된 메시지와 `None`을 반환하고, 부분 저장된 새 컬렉션은 삭제합니다. 텍스트 없는 PDF는 실패 처리하며 OCR은 지원하지 않습니다.
+청크의 `source_filename`은 원본 파일명이며, `source`와 0부터 시작하는 `page` 등 로더 메타데이터는 유지됩니다. 파일 로딩·분할은 파일별로 처리해, 실패한 PDF(손상 파일, 텍스트 없는 이미지·스캔본)는 제외하고 성공한 PDF만으로 DB를 만들며 제외된 파일명과 원인을 메시지에 함께 표시합니다. 모든 파일이 실패하거나 임베딩·저장이 실패하면 `None`을 반환하고, 부분 저장된 새 컬렉션은 삭제합니다. OCR은 지원하지 않습니다.
 
 화면 팀 연결 사항:
 
@@ -76,3 +78,27 @@ python app.py
 4. 검색 결과의 `source_filename`과 `page + 1`을 화면에 표시합니다.
 
 검증: `python -m unittest test_app -v`. 실제 PDF와 Chroma를 사용하고, 임베딩만 로컬 대체값을 사용합니다. 다중 PDF 검색·메타데이터·단일 PDF·새 컬렉션 격리·손상된 PDF·텍스트 없는 PDF·임베딩 실패를 검증합니다. 실제 OpenAI API 및 화면 연동 검증은 별도입니다.
+
+## 질문 처리 팀: 검색 방식 · 출처 · 근거 원문 · 캐시
+
+- **검색 방식 선택**: `app.py`의 `SEARCH_MODE` 하나로 바꿉니다. `similarity`(유사도) · `mmr`(겹치지 않게) · `multiquery`(질문 3개로 바꿔 검색) · `multiquery_rerank`(+ GPT 재정렬, 기본값). 재정렬이 실패하면 원래 순서로 대체하고 로그 `qa_result.rerank_ok=false`로 남깁니다.
+- **출처 표시**: 답변 아래 `참고: 원본파일명 (p.실제페이지)`. 파일명은 `source_filename`, 페이지는 `page + 1` 기준입니다 (#28).
+- **근거 원문 표시**: 답변 근거가 된 PDF 문장을 페이지별 최대 3개, 150자 이내로 그대로 보여줍니다. GPT 추가 호출은 없습니다.
+- **답변 캐시**: 같은 PDF에 같은 질문이면 저장된 답변을 바로 돌려줍니다. PDF는 컬렉션 이름(`pdf_<uuid>`)으로 구분해 다른 PDF의 답이 섞이지 않고, PDF 교체·삭제 시 해당 캐시를 지웁니다 (#24).
+- **검색 방식 비교 실험**: `python eval/compare_retrievers.py <PDF 경로>` — `eval/qa_set.jsonl` 질문으로 방식·k값별 정답 페이지 적중률과 시간을 비교해 `eval/results_retriever.csv`에 저장합니다 (실제 API 사용).
+
+검증: `python -m unittest test_step2_search -v` (외부 API 호출 없음). 캐시 격리·id 재사용 재현·캐시 정리, 검색 방식 4종, 재정렬 실패 기록을 확인합니다.
+
+## 요청별 누적 로그 (#49)
+
+`eval/qa_log.jsonl`에 JSON 한 줄씩 추가합니다. 기존 로그는 유지되며 새 기록에는 `schema_version=1`, UTC `time`, `request_id`, `operation`, `stage`, `event`가 포함됩니다. 파일은 Git에서 제외합니다.
+
+- PDF 읽기·분할, 임베딩·저장, 질문 재작성, 검색, 재정렬, 답변 생성의 단계 결과와 소요 시간을 기록합니다. 오류는 종류·메시지·traceback을 남기며, 재정렬 대체 처리와 일부 PDF 제외도 구분합니다.
+- `request_finished.status`는 `success`, `partial`(일부 PDF 제외), `cached`, `no_results`, `empty`, `error`, `cancelled`로 요청 결과를 구분합니다. 같은 `request_id`로 단계 기록을 모으고, 서로 다른 PDF 등록·질문 요청은 `collection`으로 연결할 수 있습니다.
+- `token_usage` 이벤트에 모델명과 제공자가 반환한 입력·출력·총 토큰을 기록합니다. 스트리밍도 사용량을 요청하며, 요청 종료 기록의 `token_usage`는 수집된 값의 합계입니다. 캐시 요청도 질문 재작성을 호출했다면 그 사용량이 포함됩니다.
+- LangChain 임베딩 어댑터는 실제 사용량을 노출하지 않으므로 임베딩·검색 임베딩은 `usage_status=unavailable`, 토큰은 `null`, 원인은 `embedding_adapter_usage_unavailable`로 기록합니다. 실패한 모델 호출 등 사용량이 누락되면 합계의 `usage_status=partial`이며 **실제 전체 사용량이나 과금액으로 해석하면 안 됩니다**. 토큰을 추정하지 않습니다.
+- 검색 후보와 최종 문맥에는 원본 파일명, 실제 PDF 페이지, 컬렉션 이름, 청크 ID를 기록합니다. 새 청크 ID는 Chroma 문서 ID와 동일합니다. API 키·Bearer 값·민감한 키 이름의 값은 가리고, 프롬프트·답변·문서 본문 전체는 저장하지 않습니다. 기존 QA 결과의 질문·검색 질문은 기록하므로 로그 파일 접근 권한과 공유 범위는 별도로 관리해야 합니다.
+
+로그 쓰기 실패는 요청 ID와 예외 종류를 콘솔에 알리며 앱 동작을 중단하지 않습니다. 현재 단일 프로세스 내 쓰기를 잠금으로 보호합니다. 로그는 자동 삭제·회전하지 않으므로 보관·백업은 운영 환경에서 관리합니다.
+
+오프라인 검증: `python -m unittest discover -v` (외부 API 호출 없음). 기존 PDF 테스트와 함께 정상·캐시·검색 결과 없음·오류·토큰 수집/누락·메타데이터·비밀값 가림·쓰기 실패·스트리밍 컨텍스트 전환을 확인합니다.

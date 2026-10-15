@@ -8,6 +8,8 @@ venv/
 # 로컬 실행 산출물
 .gradio/
 chroma_db/
+eval/qa_log.jsonl
+extracted_images/
 # 문서 원본 (출처는 docs/sources.md에 기록)
 *.pdf
 # macOS
