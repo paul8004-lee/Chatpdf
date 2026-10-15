@@ -688,6 +688,31 @@ footer {
     filter: brightness(1.06);
 }
 
+/* 질문할 수 없는 상태(PDF 미등록·처리 중·등록 실패)를 눈에 띄게 표시 (#55) */
+#question-box:has(textarea:disabled) {
+    border-style: dashed !important;
+    border-color: var(--muted) !important;
+}
+
+#question-box textarea:disabled::placeholder {
+    color: var(--muted) !important;
+    opacity: 1 !important;
+}
+
+#question-box textarea:disabled {
+    cursor: not-allowed !important;
+}
+
+#ask-btn:disabled,
+#ask-btn[disabled] {
+    background: var(--line) !important;
+    color: var(--fg) !important;
+    opacity: 0.85 !important;
+    box-shadow: none !important;
+    filter: none !important;
+    cursor: not-allowed !important;
+}
+
 /* 채팅 영역 */
 
 #chat-box {
@@ -857,6 +882,14 @@ def clear_selection():
     return None, _selection_status(None)
 
 
+# 질문창 안내 문구: 질문할 수 없는 이유를 상태별로 보여줌 (#55)
+QUESTION_READY = "💬 여러 PDF 문서에 대해 질문하세요..."
+QUESTION_NO_PDF = "🔒 먼저 PDF를 선택하고 '파일 등록'을 눌러야 질문할 수 있습니다."
+QUESTION_PROCESSING = "⏳ PDF 처리 중입니다. 완료되면 질문할 수 있습니다."
+QUESTION_NOT_REGISTERED = "🔒 등록된 PDF가 없어 질문할 수 없습니다. 위 안내를 확인하고 PDF를 다시 등록해 주세요."
+REGISTER_FAILED_NOTE = "\n\n🔒 PDF 등록에 성공해야 질문할 수 있습니다."
+
+
 def start_register(request: gr.Request):
 
     with _session_lock(request):
@@ -868,8 +901,8 @@ def start_register(request: gr.Request):
 
     return (
         None,
-        "⏳ PDF 처리 중입니다... 완료 후 질문할 수 있습니다.",
-        locked,
+        QUESTION_PROCESSING,
+        gr.update(interactive=False, placeholder=QUESTION_PROCESSING),
         locked,
         locked,
         locked,
@@ -882,7 +915,7 @@ def register_pdf(pdf_paths, request: gr.Request):
     if not pdf_paths:
         with request_log.request(LOG_PATH, "pdf_registration", secrets=(OPENAI_API_KEY,)) as trace:
             trace.status = "empty"
-        return None, "⚠️ PDF 파일을 선택해주세요."
+        return None, "⚠️ PDF 파일을 선택해주세요." + REGISTER_FAILED_NOTE
 
     if not OPENAI_API_KEY:
         with request_log.request(LOG_PATH, "pdf_registration") as trace:
@@ -890,7 +923,7 @@ def register_pdf(pdf_paths, request: gr.Request):
             trace.emit("validation_failed", reason="missing_api_key")
         return (
             None,
-            "⚠️ OPENAI_API_KEY가 없습니다. .env 파일을 확인해주세요."
+            "⚠️ OPENAI_API_KEY가 없습니다. .env 파일을 확인해주세요." + REGISTER_FAILED_NOTE
         )
 
     # 여러 PDF를 하나의 DB로 처리
@@ -899,17 +932,21 @@ def register_pdf(pdf_paths, request: gr.Request):
     if db is not None:
         with _session_lock(request):
             _session_dbs[request.session_hash] = db
+    else:
+        message += REGISTER_FAILED_NOTE                          # 질문이 막힌 이유 안내 (#55)
 
     return db, message
 
 
-def finish_register(db):
-
-    can_ask = gr.update(interactive=db is not None)
+def finish_register(db, message):
+    # 결과 문구와 질문창 활성화를 한 번에 바꿔 '완료됐는데 못 쓰는' 순간이 없게 함 (#55)
+    can_ask = db is not None
+    placeholder = QUESTION_READY if can_ask else QUESTION_NOT_REGISTERED
 
     return (
-        can_ask,
-        can_ask,
+        message,
+        gr.update(interactive=can_ask, placeholder=placeholder),
+        gr.update(interactive=can_ask),
         gr.update(interactive=True),
         gr.update(interactive=True),
         gr.update(interactive=True)
@@ -1010,6 +1047,7 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
     db_state = gr.State(value=None)
     selected_files = gr.State(value=None)
+    register_message = gr.State(value="")
 
     with gr.Column(elem_id="main-card"):
 
@@ -1060,7 +1098,7 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             )
 
         status = gr.Markdown(
-            "📁 등록된 문서가 없습니다.",
+            "📁 등록된 문서가 없습니다. PDF를 선택하고 '파일 등록'을 누르면 질문할 수 있습니다.",
             elem_id="upload-status"
         )
 
@@ -1077,7 +1115,7 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
         )
 
         question = gr.Textbox(
-            placeholder="💬 여러 PDF 문서에 대해 질문하세요...",
+            placeholder=QUESTION_NO_PDF,
             show_label=False,
             container=False,
             lines=1,
@@ -1142,11 +1180,12 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
     ).then(
         fn=register_pdf,
         inputs=[selected_files],
-        outputs=[db_state, status]
+        outputs=[db_state, register_message]
     ).then(
         fn=finish_register,
-        inputs=[db_state],
+        inputs=[db_state, register_message],
         outputs=[
+            status,
             question,
             ask_btn,
             pdf_file,
