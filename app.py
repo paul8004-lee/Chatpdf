@@ -1,4 +1,5 @@
 # ===== Step 1. PDF 처리 (feature/pdf-processing) =====
+import logging
 import uuid
 from pathlib import Path
 
@@ -6,43 +7,6 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
-
-# 1. build_db 함수 정의
-def build_db(pdf_path, openai_key):
-    if not openai_key:
-        return None, "⚠️ OpenAI API 키를 먼저 입력한 뒤 PDF를 다시 올려주세요."
-    if pdf_path is None:
-        return None, ""
-
-    # PDF 원본 로드 (중복 split 방지를 위해 .load() 사용 권장)
-    pages = PyPDFLoader(pdf_path).load()
-
-    # 텍스트 분할 (청크 크기 및 오버랩)
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=100,
-        length_function=len,
-        is_separator_regex=False,
-    )
-    texts = text_splitter.split_documents(pages)
-
-    # 임베딩 모델 생성
-    embeddings_model = OpenAIEmbeddings(
-        model="text-embedding-3-large",
-        openai_api_key=openai_key,
-    )
-
-    # Chroma 벡터 DB 컬렉션 생성 및 청크 임베딩 저장
-    collection_name = f"pdf_{uuid.uuid4().hex}"
-    db = Chroma.from_documents(
-        texts,
-        embeddings_model,
-        collection_name=collection_name
-    )
-
-    return db, f"✅ 처리 완료: {len(pages)}페이지 → {len(texts)}개 청크"
-
-=======
 
 def build_db(pdf_paths, openai_key):
     """단일 경로 또는 경로 목록을 받아 (새 DB, 처리 메시지)를 반환한다.
@@ -79,8 +43,7 @@ def build_db(pdf_paths, openai_key):
         for filename, chunks in documents:
             db.add_documents(chunks)
     except Exception:
-        if db is not None:
-            db.delete_collection()
+        _delete_db(db)
         return None, f"❌ 처리 실패: {filename}. PDF 파일과 API 키/연결을 확인하세요."
     chunk_count = sum(len(chunks) for _, chunks in documents)
     return db, f"✅ 처리 완료: {len(documents)}개 파일 · {page_count}페이지 · {chunk_count}개 청크"
@@ -608,8 +571,8 @@ def _delete_db(db):
         return
     try:
         db.delete_collection()
-    except Exception as e:
-        print(f"[cleanup] Chroma 컬렉션 삭제 실패: {e}")
+    except Exception:
+        logging.getLogger(__name__).exception("Chroma 컬렉션 삭제 실패")
 
 
 def select_pdf(files):
