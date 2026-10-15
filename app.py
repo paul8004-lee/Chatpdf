@@ -8,10 +8,22 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 
+NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
+
+
+def _load_failure_reason(error):
+    """파일 하나를 읽거나 나누다 실패한 이유를 사용자에게 보여줄 문구로 바꾼다."""
+    if isinstance(error, ValueError) and str(error) == NO_TEXT_ERROR:
+        return "텍스트가 없는 PDF(이미지·스캔본)"
+    return "PDF를 읽을 수 없음(손상되었거나 PDF 형식이 아님)"
+
+
 def build_db(pdf_paths, openai_key):
     """단일 경로 또는 경로 목록을 받아 (새 DB, 처리 메시지)를 반환한다.
 
-    실패 시 DB는 None이다. 기존 DB 해제와 질문 상태 제어는 호출자가 담당한다.
+    파일별로 읽기·분할하고, 실패한 파일은 제외한 채 성공한 파일만으로 DB를 만든다 (#42).
+    모든 파일이 실패하거나 임베딩·저장이 실패하면 DB는 None이다.
+    기존 DB 해제와 질문 상태 제어는 호출자가 담당한다.
     """
     if not pdf_paths:
         return None, ""
@@ -24,29 +36,43 @@ def build_db(pdf_paths, openai_key):
         length_function=len, is_separator_regex=False,
     )
     documents = []
+    failures = []
     page_count = 0
-    db = None
-    filename = Path(pdf_paths[0]).name
-    try:
-        for pdf_path in pdf_paths:
-            filename = Path(pdf_path).name
+    for pdf_path in pdf_paths:
+        filename = Path(pdf_path).name
+        try:
             pages = PyPDFLoader(str(pdf_path)).load()
             for page in pages:
                 page.metadata["source_filename"] = filename
             chunks = splitter.split_documents(pages)
             if not chunks:
-                raise ValueError("검색 가능한 텍스트가 없습니다.")
-            documents.append((filename, chunks))
-            page_count += len(pages)
+                raise ValueError(NO_TEXT_ERROR)
+        except Exception as error:
+            logging.getLogger(__name__).warning("PDF 처리 제외: %s (%s)", filename, error)
+            failures.append((filename, _load_failure_reason(error)))
+            continue
+        documents.append((filename, chunks))
+        page_count += len(pages)
+
+    failure_lines = "\n".join(f"- {name}: {reason}" for name, reason in failures)
+    if not documents:
+        return None, f"❌ 처리 실패: 등록할 수 있는 PDF가 없습니다.\n{failure_lines}"
+
+    # 임베딩·저장 실패는 API 키·연결 문제라 전체 실패로 처리
+    db = None
+    try:
         embeddings = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=openai_key)
         db = Chroma(collection_name=f"pdf_{uuid.uuid4().hex}", embedding_function=embeddings)
         for filename, chunks in documents:
             db.add_documents(chunks)
     except Exception:
         _delete_db(db)
-        return None, f"❌ 처리 실패: {filename}. PDF 파일과 API 키/연결을 확인하세요."
+        return None, f"❌ 처리 실패: {filename}. API 키/연결을 확인하세요."
     chunk_count = sum(len(chunks) for _, chunks in documents)
-    return db, f"✅ 처리 완료: {len(documents)}개 파일 · {page_count}페이지 · {chunk_count}개 청크"
+    message = f"✅ 처리 완료: {len(documents)}개 파일 · {page_count}페이지 · {chunk_count}개 청크"
+    if failures:
+        message += f"\n\n⚠️ 제외된 파일 {len(failures)}개\n{failure_lines}"
+    return db, message
 
 
 # ===== Step 2. 질문 처리 (feature/qa-chain) =====
