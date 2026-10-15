@@ -263,6 +263,25 @@ class VisualChunkBoundTest(unittest.TestCase):
         self.assertEqual((visual["vision_calls"], visual["images"], visual["skipped_duplicate"]), (1, 1, 1))
         self.assertIn("seconds", visual)
 
+    def test_parallel_model_usage_is_counted_once_with_correct_stage(self):
+        from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+        from langchain_core.messages import AIMessage
+        model = FakeMessagesListChatModel(responses=[AIMessage(content="chart summary",
+            usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})])
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.write(folder, [[noise_png(200, 200, 1)], [noise_png(200, 200, 2)]])
+            log = Path(folder) / "log.jsonl"
+            with patch.object(app, "ChatOpenAI", return_value=model), \
+                 request_log.request(log, "pdf_processing") as trace:
+                chunks = app.VisualElementChunker("test").extract_visual_chunks(str(path), "visual.pdf")
+                self.assertEqual(trace.stage, "pdf_processing")
+            events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        usage = [e for e in events if e["event"] == "token_usage"]
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(usage), 2)
+        self.assertEqual({e["stage"] for e in usage}, {"image_summary"})
+        self.assertEqual(events[-1]["token_usage"]["total_tokens"], 20)
+
 
 class SourceFormatTest(unittest.TestCase):
     """#28: 출처는 원본 파일명(source_filename)과 실제 PDF 페이지(page + 1) 기준"""
@@ -525,7 +544,7 @@ class AnswerInProgressLockTest(unittest.TestCase):
         for elem_id, event in (("send-btn", "click"), ("question-box", "submit")):
             first, deps, names = _event_chain(elem_id, event)
             self.assertEqual(len(first), 1)                     # 같은 트리거에 중복 등록 없음
-            self.assertEqual(names, ["start_answer", "ask_question", "finish_answer"])
+            self.assertEqual(names, ["_start_answer_ui", "ask_question", "_finish_answer_ui"])
             self.assertFalse(deps[0]["queue"])                  # 잠금은 큐를 기다리지 않고 즉시 적용
             self.assertFalse(deps[2]["queue"])
             self.assertFalse(deps[2]["trigger_only_on_success"])  # 오류가 나도 잠금 해제
@@ -551,7 +570,7 @@ class RegisterImmediateLockTest(unittest.TestCase):
     def test_upload_chain_starts_with_unqueued_lock(self):
         first, deps, names = _event_chain("upload-btn", "click")
         self.assertEqual(len(first), 1)
-        self.assertEqual(names, ["lock_register", "start_register", "register_pdf", "finish_register"])
+        self.assertEqual(names, ["_lock_registration_ui", "_start_registration_ui", "register_pdf", "_finish_registration_ui"])
         self.assertFalse(deps[0]["queue"])
 
 
