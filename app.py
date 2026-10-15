@@ -423,6 +423,7 @@ footer {
     color: var(--fg);
     margin: 0;
     line-height: 1.4;
+    word-break: keep-all;   /* 한글 단어 중간에서 줄바꿈하지 않음 (#40) */
 }
 
 /* 다크모드 체크박스 */
@@ -488,6 +489,19 @@ footer {
     border: 1px solid var(--line) !important;
     border-radius: 11px !important;
     min-height: 45px !important;
+}
+
+/* 질문창 안내 문구도 단어 단위로 줄바꿈 (#40) */
+#question-box textarea {
+    word-break: keep-all;
+}
+
+/* 버튼 글자는 한 줄로 표시 (#40) */
+#pdf-select,
+#upload-btn,
+#reset-select-btn {
+    white-space: nowrap !important;
+    word-break: keep-all !important;
 }
 
 #upload-status,
@@ -620,7 +634,38 @@ footer {
     #file-row {
         flex-wrap: nowrap !important;
     }
+
+    /* 좁은 화면에서는 버튼 글자·여백·최소 폭을 줄여 한 줄 유지, 카드 밖으로 넘치지 않게 (#40) */
+    #pdf-select,
+    #upload-btn {
+        font-size: 13px !important;
+        padding-left: 8px !important;
+        padding-right: 8px !important;
+        min-width: 0 !important;
+    }
 }
+
+/* 아주 좁은 폰(400px 이하): 카드 안쪽 여백 축소 (#40) */
+@media (max-width: 400px) {
+    #main-card {
+        padding: 14px 12px !important;
+    }
+}
+"""
+
+# Gradio는 css= 규칙 앞에 '.gradio-container ... .contain'을 자동으로 붙여서
+# 카드 바깥 요소(.main)에는 적용되지 않음 → head로 전역 스타일을 넣어
+# 아주 좁은 폰에서 Gradio 기본 좌우 여백(32px)을 없앰 (#40)
+HEAD_STYLE = """
+<style>
+@media (max-width: 400px) {
+    .gradio-container .main,
+    .gradio-container .fillable {
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+    }
+}
+</style>
 """
 
 
@@ -875,7 +920,7 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
                 "📂 파일 등록",
                 variant="secondary",
                 scale=2,
-                min_width=95,
+                min_width=110,
                 elem_id="upload-btn"
             )
 
@@ -1002,5 +1047,6 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 if __name__ == "__main__":
     demo.launch(
         css=CSS,
+        head=HEAD_STYLE,
         theme=gr.themes.Soft()
     )
