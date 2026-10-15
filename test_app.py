@@ -149,6 +149,35 @@ class PartialFailureTest(unittest.TestCase):
         self.assertIn("API 키/연결", message)
 
 
+class VisualChunkFallbackTest(unittest.TestCase):
+    """#65: 표·이미지 청킹을 못 써도 텍스트 PDF 등록은 되어야 함"""
+
+    def build(self, folder):
+        good = Path(folder) / "good.pdf"
+        write_pdf(good, ["apple orchard", "apple harvest"])
+        return app.build_db([str(good)], "test")
+
+    def test_without_pymupdf_registers_text_only(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            app, "OpenAIEmbeddings", return_value=LocalEmbeddings()
+        ), patch.object(app, "fitz", None), patch.object(app, "VisualElementChunker") as chunker:
+            db, message = self.build(folder)
+        chunker.assert_not_called()
+        self.assertIn("1개 파일 · 2페이지 · 2개 청크", message)
+        db.delete_collection()
+
+    def test_visual_chunk_failure_keeps_text_chunks(self):
+        for target in ("__init__", "extract_visual_chunks"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as folder, patch.object(
+                app, "OpenAIEmbeddings", return_value=LocalEmbeddings()
+            ), patch.object(app.VisualElementChunker, target, side_effect=RuntimeError("vision failed")), \
+                 self.assertLogs("app", level="WARNING") as logs:
+                db, message = self.build(folder)
+            self.assertIn("1개 파일 · 2페이지 · 2개 청크", message)
+            self.assertIn("vision failed", "\n".join(logs.output))
+            db.delete_collection()
+
+
 class SourceFormatTest(unittest.TestCase):
     """#28: 출처는 원본 파일명(source_filename)과 실제 PDF 페이지(page + 1) 기준"""
 
