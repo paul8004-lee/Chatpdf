@@ -175,6 +175,35 @@ class SourceFormatTest(unittest.TestCase):
         self.assertIn("a.pdf (p.2, 10) / b.pdf (p.1)", app._format_sources(docs))
 
 
+class PdfSelectionTest(unittest.TestCase):
+    """#41: PDF를 나눠서 선택해도 이전 선택이 유지되어야 함"""
+
+    def test_selecting_again_appends(self):
+        paths, _ = app.select_pdf(["/tmp/a/first.pdf"], None)
+        paths, status = app.select_pdf(["/tmp/b/second.pdf", "/tmp/c/third.pdf"], paths)
+        self.assertEqual(paths, ["/tmp/a/first.pdf", "/tmp/b/second.pdf", "/tmp/c/third.pdf"])
+        self.assertIn("총 3개", status)
+        for name in ("first.pdf", "second.pdf", "third.pdf"):
+            self.assertIn(name, status)
+
+    def test_same_name_is_replaced_not_duplicated(self):
+        paths, _ = app.select_pdf(["/tmp/a/report.pdf", "/tmp/a/other.pdf"], None)
+        paths, status = app.select_pdf(["/tmp/z/report.pdf"], paths)
+        self.assertEqual(paths, ["/tmp/z/report.pdf", "/tmp/a/other.pdf"])
+        self.assertIn("총 2개", status)
+
+    def test_single_file_and_empty_selection(self):
+        paths, _ = app.select_pdf("/tmp/a/one.pdf", None)
+        self.assertEqual(paths, ["/tmp/a/one.pdf"])
+        same, _ = app.select_pdf(None, paths)
+        self.assertEqual(same, paths)
+
+    def test_clear_selection(self):
+        paths, status = app.clear_selection()
+        self.assertIsNone(paths)
+        self.assertIn("선택한 PDF가 없습니다", status)
+
+
 class AnswerCacheTest(unittest.TestCase):
     """#24: 새 PDF DB에서 이전 PDF의 캐시 답변이 반환되면 안 됨"""
 
