@@ -830,6 +830,20 @@ footer {
     color: var(--fg) !important;
 }
 
+/* 채팅창 아이콘(대화 지우기·복사)이 라이트 모드에서 흰색으로 안 보이던 문제 */
+#chat-box .icon-button-wrapper,
+#chat-box .icon-button-wrapper button {
+    background: var(--field) !important;
+}
+
+#chat-box .icon-button-wrapper button,
+#chat-box .icon-button-wrapper button *,
+#chat-box .icon-button-wrapper svg,
+#chat-box .icon-button-wrapper svg * {
+    color: var(--fg) !important;
+    stroke: var(--fg) !important;
+}
+
 /* =========================
    질문 입력창
 ========================= */
@@ -1064,6 +1078,26 @@ footer {
 @media (max-width: 400px) {
     #main-card {
         padding: 14px 12px !important;
+    }
+}
+
+/* 320px: 제목 줄이 넘쳐 다크모드 토글이 카드 밖으로 잘리던 문제 */
+@media (max-width: 360px) {
+    #title-row {
+        flex-wrap: wrap !important;
+    }
+
+    #title-row > * {
+        min-width: 0 !important;
+    }
+
+    .page-title {
+        white-space: normal;
+        font-size: 15px;
+    }
+
+    #mode-select {
+        max-width: 100% !important;
     }
 }
 """
@@ -1359,16 +1393,31 @@ def history_choices(archives):
     return choices
 
 
-def archive_and_clear(history, archives):
+def _message_text(content):
+    """Gradio 6 Chatbot은 content를 [{'text': ..., 'type': 'text'}] 목록으로 넘기므로 글자만 꺼냄."""
+    if isinstance(content, list):
+        return " ".join(
+            c.get("text", "") for c in content if isinstance(c, dict)
+        )
+    return str(content or "")
+
+
+def archive_and_clear(history, archives, restored_id=None):
 
     archives = deepcopy(archives or [])
     history = deepcopy(history or [])
 
-    if history:
+    # 복원한 기록을 고치지 않고 그대로 다시 초기화하면 새로 보관하지 않음
+    already_archived = any(
+        item["id"] == restored_id and item["messages"] == history
+        for item in archives
+    )
+
+    if history and not already_archived:
 
         first_question = next(
             (
-                str(msg.get("content", ""))
+                _message_text(msg.get("content", ""))
                 for msg in history
                 if msg.get("role") == "user"
             ),
@@ -1405,21 +1454,23 @@ def archive_and_clear(history, archives):
         gr.update(
             choices=history_choices(archives),
             value=HISTORY_DEFAULT
-        )
+        ),
+        None,
+        gr.update(value=None, visible=False)
     )
 
 
 def restore_history(record_id, archives):
 
     if record_id == HISTORY_DEFAULT:
-        return gr.skip(), ""
+        return gr.skip(), "", gr.skip()
 
     for item in archives or []:
 
         if item["id"] == record_id:
-            return deepcopy(item["messages"]), ""
+            return deepcopy(item["messages"]), "", record_id
 
-    return gr.skip(), ""
+    return gr.skip(), "", gr.skip()
 
 
 # ==========================================
@@ -1444,7 +1495,7 @@ def create_chat_txt(history):
         if role not in ("user", "assistant"):
             continue
 
-        content = str(
+        content = _message_text(
             message.get("content", "")
         )
 
@@ -1502,6 +1553,7 @@ with gr.Blocks(
     db_state = gr.State(value=None)
     selected_files = gr.State(value=None)
     archived_chats = gr.State(value=[])
+    restored_id = gr.State(value=None)
     register_message = gr.State(value="")
 
     with gr.Column(elem_id="main-card"):
@@ -1768,13 +1820,16 @@ with gr.Blocks(
         fn=archive_and_clear,
         inputs=[
             chatbot,
-            archived_chats
+            archived_chats,
+            restored_id
         ],
         outputs=[
             chatbot,
             question,
             archived_chats,
-            history_menu
+            history_menu,
+            restored_id,
+            download_file
         ]
     )
 
@@ -1787,7 +1842,8 @@ with gr.Blocks(
         ],
         outputs=[
             chatbot,
-            question
+            question,
+            restored_id
         ]
     )
 
