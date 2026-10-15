@@ -7,43 +7,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 
-# 1. build_db 함수 정의
-def build_db(pdf_path, openai_key):
-    if not openai_key:
-        return None, "⚠️ OpenAI API 키를 먼저 입력한 뒤 PDF를 다시 올려주세요."
-    if pdf_path is None:
-        return None, ""
-
-    # PDF 원본 로드 (중복 split 방지를 위해 .load() 사용 권장)
-    pages = PyPDFLoader(pdf_path).load()
-
-    # 텍스트 분할 (청크 크기 및 오버랩)
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=100,
-        length_function=len,
-        is_separator_regex=False,
-    )
-    texts = text_splitter.split_documents(pages)
-
-    # 임베딩 모델 생성
-    embeddings_model = OpenAIEmbeddings(
-        model="text-embedding-3-large",
-        openai_api_key=openai_key,
-    )
-
-    # Chroma 벡터 DB 컬렉션 생성 및 청크 임베딩 저장
-    collection_name = f"pdf_{uuid.uuid4().hex}"
-    db = Chroma.from_documents(
-        texts,
-        embeddings_model,
-        collection_name=collection_name
-    )
-
-    return db, f"✅ 처리 완료: {len(pages)}페이지 → {len(texts)}개 청크"
-
-=======
-
 def build_db(pdf_paths, openai_key):
     """단일 경로 또는 경로 목록을 받아 (새 DB, 처리 메시지)를 반환한다.
 
@@ -98,7 +61,7 @@ import re                        # 정규표현식: 파일 경로에서 파일 �
 import time                      # 답변에 걸린 시간(초)을 잴 때 사용
 import weakref                   # DB 객체가 사라지는 순간을 감지해서 그 DB의 캐시를 지울 때 사용
 from datetime import datetime    # 성능 기록에 "언제 질문했는지" 날짜·시간을 남길 때 사용
-from pathlib import Path         # 파일 경로를 운영체제(Windows/Linux)에 상관없이 다루는 도구
+
 
 # ---------- 외부 패키지 (requirements.txt로 설치됨) ----------
 import gradio as gr              # 웹 화면 라이브러리. 여기서는 gr.Error로 화면에 오류 메시지를 띄우는 데 사용
@@ -116,6 +79,15 @@ MAX_QUESTION_LEN = 500           # 질문 최대 글자 수 (너무 긴 질문�
 MAX_HISTORY_TURNS = 3            # 후속 질문을 이해하려고 참고할 '최근 대화' 개수 (질문+답변 한 쌍이 1개)
 CACHE_SIZE = 100                 # 답변 캐시(임시 저장소)에 보관할 최대 질문 수
 LOG_PATH = Path("eval/qa_log.jsonl")  # 질문별 성능 기록을 저장할 파일 위치
+
+# ---------- 검색 방식 설정 ----------
+# 이 값 하나만 바꾸면 검색 방식이 바뀜
+#   "similarity"        : 질문과 가장 비슷한 조각 TOP_K개 (기본 방식)
+#   "mmr"               : 비슷하면서도 내용이 겹치지 않는 조각 TOP_K개
+#   "multiquery"        : 질문을 3개로 바꿔 각각 검색 (GPT 1회 추가)
+#   "multiquery_rerank" : multiquery + GPT가 순위 재정렬 (GPT 2회 추가)
+SEARCH_MODES = ("similarity", "mmr", "multiquery", "multiquery_rerank")
+SEARCH_MODE = "multiquery_rerank"  # 비교 실험 후 최종 결정
 
 _answer_cache = {}               # 답변 캐시: {(PDF 고유 이름, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
 _watched_db_keys = set()         # 사라지면 캐시를 지우도록 등록해 둔 DB 이름 목록 (중복 등록 방지)
@@ -188,15 +160,66 @@ def _format_sources(docs):
     return "\n\n---\n**참고**: " + " / ".join(parts)              # 구분선(---) 아래에 굵은 글씨 '참고'로 표시
 
 
-def _rerank(llm, docs, query):
-    """[업그레이드 1] 검색된 조각들 중 질문과 가장 관련 있는 TOP_K개를 GPT가 골라 순서를 다시 매김."""
-    if len(docs) <= TOP_K:                                      # 조각이 이미 TOP_K개 이하면 고를 필요가 없으니
-        return docs                                             #   그대로 돌려줌 (API 호출 절약)
+def _rerank(llm, docs, query, k=None):
+    """검색된 조각 중 질문과 가장 관련 있는 k개를 GPT가 골라 순서를 다시 매김.
+    반환: (조각 목록, 재정렬 성공 여부)
+    """
+    # k를 안 주면 설정값 TOP_K 사용
+    k = k or TOP_K
+
+    # 조각이 이미 k개 이하면 고를 필요 없음 (API 호출 절약)
+    if len(docs) <= k:
+        return docs, True
+
     try:
-        reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=TOP_K)       # GPT로 순위를 매기는 도구 생성
-        return list(reranker.compress_documents(docs, query)) or docs[:TOP_K]  # 순위가 높은 TOP_K개만 받음 (결과가 비면 앞에서 TOP_K개)
-    except Exception:                                           # 재정렬 중 어떤 오류가 나도
-        return docs[:TOP_K]                                     #   답변은 계속되도록 원래 순서의 앞 TOP_K개를 사용
+        reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=k)
+        ranked = list(reranker.compress_documents(docs, query))
+        if ranked:
+            return ranked, True
+        # 결과가 비면 원래 순서의 앞 k개 사용 (실패로 기록)
+        return docs[:k], False
+    except Exception:
+        # 오류가 나도 답변은 계속되도록 원래 순서의 앞 k개 사용 (실패로 기록)
+        return docs[:k], False
+
+
+def _retrieve(db, llm, query, mode=None, k=None):
+    """[검색 방식 변경] SEARCH_MODE에 맞는 방식으로 PDF 조각을 찾음.
+    반환: (조각 목록, 재정렬 성공 여부). 재정렬을 안 하는 방식이면 None.
+    answer()와 비교 실험 스크립트(eval/compare_retrievers.py)가 같이 씀.
+    """
+    # 값을 안 주면 설정값 사용
+    mode = mode or SEARCH_MODE
+    k = k or TOP_K
+    if mode not in SEARCH_MODES:
+        raise ValueError(f"알 수 없는 검색 방식: {mode} (가능: {SEARCH_MODES})")
+
+    # 1) 기본 검색기 만들기
+    if mode == "similarity":
+        # 질문과 가장 비슷한 k개
+        base = db.as_retriever(search_kwargs={"k": k})
+    else:
+        # MMR: 후보 k×5개 중 서로 겹치지 않게 k개
+        base = db.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": k * 5})
+
+    # 2) similarity, mmr은 여기서 끝
+    if mode in ("similarity", "mmr"):
+        return base.invoke(query), None
+
+    # 3) 멀티쿼리: 질문을 3개로 바꿔 원래 질문까지 총 4번 검색 (중복은 자동 제거)
+    retriever = MultiQueryRetriever.from_llm(
+        retriever=base,
+        llm=llm,
+        prompt=MULTI_QUERY_PROMPT,
+        include_original=True,
+    )
+    docs = retriever.invoke(query)
+
+    if mode == "multiquery":
+        return docs[:k], None
+
+    # 4) 재정렬: 후보 k×2개 중 GPT가 k개를 고름
+    return _rerank(llm, docs[: k * 2], query, k)
 
 
 def _db_key(db):
@@ -328,24 +351,14 @@ def answer(question, openai_key, db, history=None):
         # ===== 3단계: [업그레이드 2] 캐시 확인 =====
         cached = _cache_get(db, search_question)                # 같은 질문에 대한 저장된 답변이 있는지 확인
         if cached:                                              # 있으면
-            _log(question=question, search_question=search_question, cached=True,  # 캐시로 답했다고 기록
-                 seconds=round(time.perf_counter() - start, 2))  # 걸린 시간(초, 소수점 둘째 자리까지)
+            _log(question=question, search_question=search_question, cached=True,
+                 mode=SEARCH_MODE,
+                 seconds=round(time.perf_counter() - start, 2))
             yield cached                                        # 저장된 답변을 바로 화면에 보여주고
             return                                              # 함수 끝 (검색·GPT 호출 생략 → 빠르고 비용 0)
 
-        # ===== 4단계: PDF에서 관련 내용 검색 =====
-        base_retriever = db.as_retriever(                       # 벡터 DB를 '검색기'로 변환
-            search_type="mmr",                                  # MMR: 비슷한 내용만 몰리지 않게 다양한 조각을 고르는 방식
-            search_kwargs={"k": TOP_K, "fetch_k": TOP_K * 5}    # 후보 20개를 먼저 찾고 그중 다양하게 4개 선택
-        )
-        retriever = MultiQueryRetriever.from_llm(               # 멀티쿼리 검색기: 질문을 3개로 바꿔 각각 검색
-            retriever=base_retriever,                           # 실제 검색은 위의 MMR 검색기가 담당
-            llm=llm,                                            # 질문 3개를 만드는 데 GPT 사용
-            prompt=MULTI_QUERY_PROMPT,                          # 한국어 질문을 만들도록 직접 만든 프롬프트 사용
-            include_original=True,                              # 바꾼 질문 3개 + 원래 질문까지 총 4번 검색
-        )
-        docs = retriever.invoke(search_question)[: TOP_K * 2]   # 검색 실행. 중복 제거된 결과 중 앞 8개만 사용
-        docs = _rerank(llm, docs, search_question)              # [업그레이드 1] 8개 중 가장 관련 있는 4개로 추림
+        # ===== 4단계: PDF에서 관련 내용 검색 (방식은 SEARCH_MODE 설정을 따름) =====
+        docs, rerank_ok = _retrieve(db, llm, search_question)
 
         if not docs:                                            # 관련 내용을 하나도 못 찾았으면
             yield "업로드한 문서에서 관련 내용을 찾지 못했습니다. 질문을 바꿔서 다시 시도해 보세요."  # 안내 문구 표시
@@ -366,9 +379,10 @@ def answer(question, openai_key, db, history=None):
 
         # ===== 7단계: [업그레이드 2, 3] 캐시 저장 + 성능 기록 =====
         _cache_put(db, search_question, final)                  # 다음에 같은 질문이 오면 바로 답하도록 저장
-        _log(question=question, search_question=search_question, cached=False,  # 새로 답변했다고 기록
-             seconds=round(time.perf_counter() - start, 2),     # 전체 걸린 시간(초)
-             pages=[_page_label(d.metadata) for d in docs])     # 답변 근거로 쓴 페이지 목록
+        _log(question=question, search_question=search_question, cached=False,
+             mode=SEARCH_MODE, rerank_ok=rerank_ok,
+             seconds=round(time.perf_counter() - start, 2),
+             pages=[_page_label(d.metadata) for d in docs])
 
     # ===== 오류 처리: OpenAI 오류를 사용자가 이해할 수 있는 한국어로 안내 =====
     except openai.AuthenticationError:                          # API 키가 틀렸거나 만료된 경우
