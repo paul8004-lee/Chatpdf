@@ -10,9 +10,17 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 import request_log
 import base64
-import pymupdf as fitz
+import os
+from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
+
+# 표·이미지 청킹용 PyMuPDF가 없어도 앱은 켜지고 텍스트 PDF 등록은 되도록 함 (#65)
+try:
+    import pymupdf as fitz
+except ImportError:
+    fitz = None
+    logging.getLogger(__name__).warning("pymupdf가 없어 표·이미지 청킹을 건너뜁니다. pip install -r requirements.txt")
 
 NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
 
@@ -183,7 +191,13 @@ def _build_db(pdf_paths, openai_key):
     documents = []
     failures = []
     page_count = 0
-    visual_chunker = VisualElementChunker(api_key=openai_key)
+    # 시각 청킹 준비가 실패해도 텍스트 청크만으로 등록을 이어감 (#65)
+    visual_chunker = None
+    if fitz is not None:
+        try:
+            visual_chunker = VisualElementChunker(api_key=openai_key)
+        except Exception as error:
+            logging.getLogger(__name__).warning("시각 청킹 준비 실패: %s", error)
     for pdf_path in pdf_paths:
         filename = Path(pdf_path).name
         try:
@@ -191,12 +205,14 @@ def _build_db(pdf_paths, openai_key):
                 pages = PyPDFLoader(str(pdf_path)).load()
                 for page in pages:
                     page.metadata["source_filename"] = filename
+                text_chunks = splitter.split_documents(pages)
                 # 시각 요소(표, 이미지) 청크 추출
-                try:
-                    visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
-                except Exception as ve:
-                    logging.getLogger(__name__).warning("시각 청크 추출 실패(%s): %s", filename, ve)
-                    visual_chunks = []
+                visual_chunks = []
+                if visual_chunker is not None:
+                    try:
+                        visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
+                    except Exception as ve:
+                        logging.getLogger(__name__).warning("시각 청크 추출 실패(%s): %s", filename, ve)
 
                 chunks = text_chunks + visual_chunks
                 if not chunks:

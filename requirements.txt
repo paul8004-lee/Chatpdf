@@ -9,4 +9,6 @@ langchainhub
 langgraph<1.0
 chromadb
 pypdf
+pymupdf>=1.26,<2
+tabulate>=0.9,<1
 python-dotenv
