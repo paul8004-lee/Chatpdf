@@ -1,4 +1,5 @@
 # ===== Step 1. PDF 처리 (feature/pdf-processing) =====
+import logging
 import uuid
 from pathlib import Path
 
@@ -6,7 +7,6 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
-
 
 def build_db(pdf_paths, openai_key):
     """단일 경로 또는 경로 목록을 받아 (새 DB, 처리 메시지)를 반환한다.
@@ -43,8 +43,7 @@ def build_db(pdf_paths, openai_key):
         for filename, chunks in documents:
             db.add_documents(chunks)
     except Exception:
-        if db is not None:
-            db.delete_collection()
+        _delete_db(db)
         return None, f"❌ 처리 실패: {filename}. PDF 파일과 API 키/연결을 확인하세요."
     chunk_count = sum(len(chunks) for _, chunks in documents)
     return db, f"✅ 처리 완료: {len(documents)}개 파일 · {page_count}페이지 · {chunk_count}개 청크"
@@ -60,8 +59,9 @@ def build_db(pdf_paths, openai_key):
 import json                      # 성능 기록을 JSON 형식(한 줄짜리 텍스트)으로 저장할 때 사용
 import re                        # 정규표현식: 파일 경로에서 파일 이름만 잘라낼 때 사용
 import time                      # 답변에 걸린 시간(초)을 잴 때 사용
+import weakref                   # DB 객체가 사라지는 순간을 감지해서 그 DB의 캐시를 지울 때 사용
 from datetime import datetime    # 성능 기록에 "언제 질문했는지" 날짜·시간을 남길 때 사용
-from pathlib import Path         # 파일 경로를 운영체제(Windows/Linux)에 상관없이 다루는 도구
+
 
 # ---------- 외부 패키지 (requirements.txt로 설치됨) ----------
 import gradio as gr              # 웹 화면 라이브러리. 여기서는 gr.Error로 화면에 오류 메시지를 띄우는 데 사용
@@ -80,7 +80,18 @@ MAX_HISTORY_TURNS = 3            # 후속 질문을 이해하려고 참고할 '�
 CACHE_SIZE = 100                 # 답변 캐시(임시 저장소)에 보관할 최대 질문 수
 LOG_PATH = Path("eval/qa_log.jsonl")  # 질문별 성능 기록을 저장할 파일 위치
 
-_answer_cache = {}               # 답변 캐시: {(PDF DB 번호, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
+# ---------- 검색 방식 설정 ----------
+# 이 값 하나만 바꾸면 검색 방식이 바뀜
+#   "similarity"        : 질문과 가장 비슷한 조각 TOP_K개 (기본 방식)
+#   "mmr"               : 비슷하면서도 내용이 겹치지 않는 조각 TOP_K개
+#   "multiquery"        : 질문을 3개로 바꿔 각각 검색 (GPT 1회 추가)
+#   "multiquery_rerank" : multiquery + GPT가 순위 재정렬 (GPT 2회 추가)
+SEARCH_MODES = ("similarity", "mmr", "multiquery", "multiquery_rerank")
+SEARCH_MODE = "multiquery_rerank"  # 비교 실험 후 최종 결정
+
+_answer_cache = {}               # 답변 캐시: {(PDF 고유 이름, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
+_watched_db_keys = set()         # 사라지면 캐시를 지우도록 등록해 둔 DB 이름 목록 (중복 등록 방지)
+_dead_db_keys = set()            # 이미 사라진 DB 이름 목록. 다음 캐시 사용 때 그 DB의 캐시를 지움
 
 # ---------- 프롬프트 1: 멀티쿼리 (검색어 늘리기) ----------
 # 질문 하나로만 검색하면 표현이 조금만 달라도 관련 내용을 놓칠 수 있음.
@@ -149,27 +160,134 @@ def _format_sources(docs):
     return "\n\n---\n**참고**: " + " / ".join(parts)              # 구분선(---) 아래에 굵은 글씨 '참고'로 표시
 
 
-def _rerank(llm, docs, query):
-    """[업그레이드 1] 검색된 조각들 중 질문과 가장 관련 있는 TOP_K개를 GPT가 골라 순서를 다시 매김."""
-    if len(docs) <= TOP_K:                                      # 조각이 이미 TOP_K개 이하면 고를 필요가 없으니
-        return docs                                             #   그대로 돌려줌 (API 호출 절약)
+def _rerank(llm, docs, query, k=None):
+    """검색된 조각 중 질문과 가장 관련 있는 k개를 GPT가 골라 순서를 다시 매김.
+    반환: (조각 목록, 재정렬 성공 여부)
+    """
+    # k를 안 주면 설정값 TOP_K 사용
+    k = k or TOP_K
+
+    # 조각이 이미 k개 이하면 고를 필요 없음 (API 호출 절약)
+    if len(docs) <= k:
+        return docs, True
+
     try:
-        reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=TOP_K)       # GPT로 순위를 매기는 도구 생성
-        return list(reranker.compress_documents(docs, query)) or docs[:TOP_K]  # 순위가 높은 TOP_K개만 받음 (결과가 비면 앞에서 TOP_K개)
-    except Exception:                                           # 재정렬 중 어떤 오류가 나도
-        return docs[:TOP_K]                                     #   답변은 계속되도록 원래 순서의 앞 TOP_K개를 사용
+        reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=k)
+        ranked = list(reranker.compress_documents(docs, query))
+        if ranked:
+            return ranked, True
+        # 결과가 비면 원래 순서의 앞 k개 사용 (실패로 기록)
+        return docs[:k], False
+    except Exception:
+        # 오류가 나도 답변은 계속되도록 원래 순서의 앞 k개 사용 (실패로 기록)
+        return docs[:k], False
+
+
+def _retrieve(db, llm, query, mode=None, k=None):
+    """[검색 방식 변경] SEARCH_MODE에 맞는 방식으로 PDF 조각을 찾음.
+    반환: (조각 목록, 재정렬 성공 여부). 재정렬을 안 하는 방식이면 None.
+    answer()와 비교 실험 스크립트(eval/compare_retrievers.py)가 같이 씀.
+    """
+    # 값을 안 주면 설정값 사용
+    mode = mode or SEARCH_MODE
+    k = k or TOP_K
+    if mode not in SEARCH_MODES:
+        raise ValueError(f"알 수 없는 검색 방식: {mode} (가능: {SEARCH_MODES})")
+
+    # 1) 기본 검색기 만들기
+    if mode == "similarity":
+        # 질문과 가장 비슷한 k개
+        base = db.as_retriever(search_kwargs={"k": k})
+    else:
+        # MMR: 후보 k×5개 중 서로 겹치지 않게 k개
+        base = db.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": k * 5})
+
+    # 2) similarity, mmr은 여기서 끝
+    if mode in ("similarity", "mmr"):
+        return base.invoke(query), None
+
+    # 3) 멀티쿼리: 질문을 3개로 바꿔 원래 질문까지 총 4번 검색 (중복은 자동 제거)
+    retriever = MultiQueryRetriever.from_llm(
+        retriever=base,
+        llm=llm,
+        prompt=MULTI_QUERY_PROMPT,
+        include_original=True,
+    )
+    docs = retriever.invoke(query)
+
+    if mode == "multiquery":
+        return docs[:k], None
+
+    # 4) 재정렬: 후보 k×2개 중 GPT가 k개를 고름
+    return _rerank(llm, docs[: k * 2], query, k)
+
+
+def _db_key(db):
+    """[버그 수정] 캐시에서 PDF DB를 구분하는 고유 이름.
+    예전에는 id(db)(메모리 주소)를 썼는데, DB를 버리고 새 DB를 만들면
+    파이썬이 같은 주소를 다시 줄 수 있어서 이전 PDF의 답변이 나오는 문제가 있었음.
+    → Step 1이 업로드마다 새로 만드는 고유 컬렉션 이름(pdf_<uuid>)을 사용.
+    (db._collection은 DB 삭제 후 오류가 나므로, 삭제 후에도 남는 _collection_name을 씀)
+    """
+    return getattr(db, "_collection_name", None) or id(db)    # 이름이 없는 DB만 예전처럼 id 사용
+
+
+def _remove_cache_of(key):
+    """key(DB 이름)에 해당하는 캐시를 모두 지우고, 지운 개수를 돌려줌."""
+    old = [k for k in list(_answer_cache) if k[0] == key]        # 이 DB로 저장된 (DB 이름, 질문) 목록
+    for k in old:
+        _answer_cache.pop(k, None)                               # 하나씩 삭제 (이미 없으면 무시)
+    return len(old)
+
+
+def _purge_dead_caches():
+    """사라진 DB들의 캐시를 정리함. 캐시를 읽거나 쓰기 직전에 매번 호출."""
+    while _dead_db_keys:                                         # 정리할 DB가 남아 있는 동안
+        key = _dead_db_keys.pop()                                #   하나 꺼내서
+        _remove_cache_of(key)                                    #   그 DB의 캐시 삭제
+        _watched_db_keys.discard(key)                            #   감시 목록에서도 제거
+
+
+def _watch_db(db, key):
+    """DB 객체가 사라지면(새 PDF 등록으로 버려지는 경우 등) 그 DB 이름을 '정리 대상'에 넣도록 등록.
+    여기서 바로 지우지 않는 이유: 객체가 사라지는 시점은 예측할 수 없어서,
+    캐시를 사용하는 도중에 지우면 오류가 날 수 있음 → 다음 캐시 사용 때 안전하게 정리."""
+    if key in _watched_db_keys:                                  # 이미 등록했으면
+        return                                                   #   다시 등록하지 않음
+    try:
+        weakref.finalize(db, _dead_db_keys.add, key)             # db가 사라지는 순간 key를 정리 대상에 추가
+        _watched_db_keys.add(key)
+    except TypeError:                                            # 감시할 수 없는 객체면 (드묾)
+        pass                                                     #   자동 정리만 생략 (캐시 구분은 정상 동작)
 
 
 def _cache_get(db, query):
     """[업그레이드 2] 같은 PDF(db)에 같은 질문(query)을 한 적이 있으면 저장해 둔 답변을 꺼냄. 없으면 None."""
-    return _answer_cache.get((id(db), query))                   # id(db): 지금 올린 PDF 데이터베이스를 구분하는 고유 번호
+    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
+    return _answer_cache.get((_db_key(db), query))               # (PDF 고유 이름, 질문)으로 저장된 답변 찾기
 
 
 def _cache_put(db, query, text):
     """[업그레이드 2] 새로 만든 답변을 캐시에 저장함."""
-    if len(_answer_cache) >= CACHE_SIZE:                        # 캐시가 가득 찼으면
-        _answer_cache.pop(next(iter(_answer_cache)))            #   가장 먼저 저장된(가장 오래된) 답변 1개를 지움
-    _answer_cache[(id(db), query)] = text                       # (PDF 번호, 질문)을 열쇠로 답변을 저장
+    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
+    if len(_answer_cache) >= CACHE_SIZE:                         # 캐시가 가득 찼으면
+        _answer_cache.pop(next(iter(_answer_cache)))             #   가장 먼저 저장된(가장 오래된) 답변 1개를 지움
+    key = _db_key(db)                                            # 이 PDF의 고유 이름
+    _answer_cache[(key, query)] = text                           # (PDF 고유 이름, 질문)을 열쇠로 답변을 저장
+    _watch_db(db, key)                                           # 이 DB가 사라지면 캐시가 자동 정리되도록 등록
+
+
+def clear_answer_cache(db=None):
+    """[버그 수정 · 화면 팀 호출용] 캐시를 직접 정리함.
+    db를 주면 그 PDF의 캐시만, 안 주면 전체 캐시를 지움. 반환: 지운 개수.
+    DB를 직접 삭제할 때(old_db.delete_collection()) 그 전에 호출하면 됨.
+    """
+    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
+    if db is None:                                               # 전체 삭제
+        count = len(_answer_cache)
+        _answer_cache.clear()
+        return count
+    return _remove_cache_of(_db_key(db))                         # 이 PDF의 캐시만 삭제
 
 
 def _log(**record):
@@ -233,24 +351,14 @@ def answer(question, openai_key, db, history=None):
         # ===== 3단계: [업그레이드 2] 캐시 확인 =====
         cached = _cache_get(db, search_question)                # 같은 질문에 대한 저장된 답변이 있는지 확인
         if cached:                                              # 있으면
-            _log(question=question, search_question=search_question, cached=True,  # 캐시로 답했다고 기록
-                 seconds=round(time.perf_counter() - start, 2))  # 걸린 시간(초, 소수점 둘째 자리까지)
+            _log(question=question, search_question=search_question, cached=True,
+                 mode=SEARCH_MODE,
+                 seconds=round(time.perf_counter() - start, 2))
             yield cached                                        # 저장된 답변을 바로 화면에 보여주고
             return                                              # 함수 끝 (검색·GPT 호출 생략 → 빠르고 비용 0)
 
-        # ===== 4단계: PDF에서 관련 내용 검색 =====
-        base_retriever = db.as_retriever(                       # 벡터 DB를 '검색기'로 변환
-            search_type="mmr",                                  # MMR: 비슷한 내용만 몰리지 않게 다양한 조각을 고르는 방식
-            search_kwargs={"k": TOP_K, "fetch_k": TOP_K * 5}    # 후보 20개를 먼저 찾고 그중 다양하게 4개 선택
-        )
-        retriever = MultiQueryRetriever.from_llm(               # 멀티쿼리 검색기: 질문을 3개로 바꿔 각각 검색
-            retriever=base_retriever,                           # 실제 검색은 위의 MMR 검색기가 담당
-            llm=llm,                                            # 질문 3개를 만드는 데 GPT 사용
-            prompt=MULTI_QUERY_PROMPT,                          # 한국어 질문을 만들도록 직접 만든 프롬프트 사용
-            include_original=True,                              # 바꾼 질문 3개 + 원래 질문까지 총 4번 검색
-        )
-        docs = retriever.invoke(search_question)[: TOP_K * 2]   # 검색 실행. 중복 제거된 결과 중 앞 8개만 사용
-        docs = _rerank(llm, docs, search_question)              # [업그레이드 1] 8개 중 가장 관련 있는 4개로 추림
+        # ===== 4단계: PDF에서 관련 내용 검색 (방식은 SEARCH_MODE 설정을 따름) =====
+        docs, rerank_ok = _retrieve(db, llm, search_question)
 
         if not docs:                                            # 관련 내용을 하나도 못 찾았으면
             yield "업로드한 문서에서 관련 내용을 찾지 못했습니다. 질문을 바꿔서 다시 시도해 보세요."  # 안내 문구 표시
@@ -271,9 +379,10 @@ def answer(question, openai_key, db, history=None):
 
         # ===== 7단계: [업그레이드 2, 3] 캐시 저장 + 성능 기록 =====
         _cache_put(db, search_question, final)                  # 다음에 같은 질문이 오면 바로 답하도록 저장
-        _log(question=question, search_question=search_question, cached=False,  # 새로 답변했다고 기록
-             seconds=round(time.perf_counter() - start, 2),     # 전체 걸린 시간(초)
-             pages=[_page_label(d.metadata) for d in docs])     # 답변 근거로 쓴 페이지 목록
+        _log(question=question, search_question=search_question, cached=False,
+             mode=SEARCH_MODE, rerank_ok=rerank_ok,
+             seconds=round(time.perf_counter() - start, 2),
+             pages=[_page_label(d.metadata) for d in docs])
 
     # ===== 오류 처리: OpenAI 오류를 사용자가 이해할 수 있는 한국어로 안내 =====
     except openai.AuthenticationError:                          # API 키가 틀렸거나 만료된 경우
@@ -283,4 +392,635 @@ def answer(question, openai_key, db, history=None):
     except openai.APIConnectionError:                           # 인터넷 연결 문제 등으로 OpenAI 서버에 접속 못 한 경우
         raise gr.Error("OpenAI 서버에 연결할 수 없습니다. 네트워크를 확인하세요.")
 
+
 # ===== Step 3. 화면 (feature/chat-ui) =====
+
+import os
+import threading
+import gradio as gr
+from pathlib import Path
+from dotenv import load_dotenv
+
+
+# ==========================================
+# 1. 환경변수 및 세션 관리
+# ==========================================
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+_session_dbs = {}
+_session_locks = {}
+_sessions_guard = threading.Lock()
+
+
+# ==========================================
+# 2. CSS 디자인 + 다크모드
+# ==========================================
+
+CSS = """
+.gradio-container {
+    --page: #FFFFFF;
+    --card: #FFFFFF;
+    --field: #FFFFFF;
+    --answer: #F7F9FF;
+    --fg: #202638;
+    --muted: #738096;
+    --line: #E3E8F1;
+
+    background: var(--page) !important;
+    color: var(--fg) !important;
+    max-width: 720px !important;
+    margin: 0 auto !important;
+    padding: 30px 18px !important;
+    min-height: 100vh;
+    font-family: 'Pretendard', Arial, sans-serif !important;
+}
+
+html, body {
+    background: #FFFFFF !important;
+}
+
+/* 다크모드 */
+
+html:has(#mode-select input[type="checkbox"]:checked),
+body:has(#mode-select input[type="checkbox"]:checked) {
+    background: #11141C !important;
+}
+
+.gradio-container:has(#mode-select input[type="checkbox"]:checked) {
+    --page: #11141C;
+    --card: #1A1E2B;
+    --field: #252B3A;
+    --answer: #252B3A;
+    --fg: #F3F5FA;
+    --muted: #ACB5C8;
+    --line: #394256;
+    color-scheme: dark;
+}
+
+footer {
+    display: none !important;
+}
+
+/* 메인 카드 */
+
+#main-card {
+    background: var(--card) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 20px !important;
+    padding: 24px !important;
+    box-shadow: 0 10px 30px rgba(40,60,100,.05);
+    gap: 14px !important;
+}
+
+/* 제목 */
+
+#title-row {
+    align-items: center !important;
+}
+
+.page-title {
+    font-size: 21px;
+    font-weight: 800;
+    color: var(--fg);
+    margin: 0;
+    line-height: 1.4;
+}
+
+/* 다크모드 체크박스 */
+
+#mode-select {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    min-width: 0 !important;
+}
+
+#mode-select label,
+#mode-select span {
+    color: var(--fg) !important;
+    font-size: 13px !important;
+}
+
+/* 그라데이션 구분선 */
+
+.gradient-line {
+    width: 100%;
+    height: 3px;
+    border-radius: 99px;
+    background: linear-gradient(
+        90deg, #329AFF, #8578FF, #FF65AF
+    );
+    margin: 3px 0 9px;
+}
+
+/* 영역 제목 */
+
+.section-label {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--fg);
+    margin: 0 0 5px;
+}
+
+/* PDF 업로드 */
+
+#file-row {
+    align-items: stretch !important;
+    gap: 10px !important;
+}
+
+#pdf-select {
+    border-radius: 11px !important;
+    background: var(--field) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    min-height: 45px !important;
+    box-shadow: none !important;
+}
+
+#pdf-select,
+#pdf-select * {
+    color: var(--fg) !important;
+}
+
+#upload-btn {
+    background: var(--answer) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 11px !important;
+    min-height: 45px !important;
+}
+
+#upload-status,
+#upload-status * {
+    color: var(--muted) !important;
+    font-size: 12px !important;
+}
+
+/* 질문 입력창 */
+
+#question-box {
+    background: var(--field) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+    overflow: hidden !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+
+#question-box textarea {
+    display: block !important;
+    background: transparent !important;
+    color: var(--fg) !important;
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
+    border-radius: 12px !important;
+    padding: 14px !important;
+    font-size: 14px !important;
+    line-height: 1.6 !important;
+    min-height: 60px !important;
+}
+
+#question-box textarea::placeholder {
+    color: var(--muted) !important;
+}
+
+#question-box:focus-within {
+    border-color: #827AFF !important;
+}
+
+/* 질문하기 버튼 */
+
+#ask-btn {
+    background: linear-gradient(
+        110deg,
+        #329AFF 0%,
+        #827AFF 50%,
+        #FF65AF 100%
+    ) !important;
+    border: none !important;
+    color: #FFFFFF !important;
+    border-radius: 12px !important;
+    min-height: 47px !important;
+    font-size: 14px !important;
+    font-weight: 750 !important;
+    box-shadow: 0 5px 14px rgba(130,122,255,.15);
+}
+
+#ask-btn:hover {
+    filter: brightness(1.06);
+}
+
+/* 채팅 영역 */
+
+#chat-box {
+    background: var(--answer) !important;
+    border: 1px solid var(--line) !important;
+    border-left: 4px solid #827AFF !important;
+    border-radius: 12px !important;
+    box-shadow: none !important;
+}
+
+#chat-box .message {
+    border: 1px solid var(--line) !important;
+}
+
+#chat-box .message.user {
+    background: var(--field) !important;
+}
+
+#chat-box .message.bot,
+#chat-box .message.assistant {
+    background: var(--card) !important;
+}
+
+#chat-box,
+#chat-box * {
+    color: var(--fg) !important;
+}
+
+/* 초기화 버튼 */
+
+#clear-btn {
+    background: var(--answer) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+    min-height: 40px !important;
+    box-shadow: none !important;
+}
+
+/* 모바일 */
+
+@media (max-width: 600px) {
+    .gradio-container {
+        padding: 12px 8px !important;
+    }
+
+    #main-card {
+        padding: 16px !important;
+        border-radius: 16px !important;
+    }
+
+    .page-title {
+        font-size: 18px;
+    }
+
+    #file-row {
+        flex-wrap: nowrap !important;
+    }
+}
+"""
+
+
+# ==========================================
+# 3. 세션 및 DB 관리 함수
+# ==========================================
+
+def _session_lock(request):
+    with _sessions_guard:
+        return _session_locks.setdefault(
+            request.session_hash,
+            threading.Lock()
+        )
+
+
+def _delete_db(db):
+    if db is None:
+        return
+
+    try:
+        db.delete_collection()
+    except Exception:
+        logging.getLogger(__name__).exception("Chroma 컬렉션 삭제 실패")
+
+
+# ==========================================
+# 4. PDF 다중 업로드
+# ==========================================
+
+def select_pdf(files):
+
+    if not files:
+        return None, "📎 PDF 파일을 선택해주세요."
+
+    if not isinstance(files, list):
+        files = [files]
+
+    paths = [
+        f if isinstance(f, str) else f.name
+        for f in files
+    ]
+
+    filenames = [Path(path).name for path in paths]
+
+    status = (
+        f"✅ 총 {len(paths)}개 PDF 선택 완료\n\n"
+        + "\n".join(
+            f"- 📄 {name}"
+            for name in filenames
+        )
+    )
+
+    return paths, status
+
+
+def start_register(request: gr.Request):
+
+    with _session_lock(request):
+        _delete_db(
+            _session_dbs.pop(request.session_hash, None)
+        )
+
+    locked = gr.update(interactive=False)
+
+    return (
+        None,
+        "⏳ PDF 처리 중입니다... 완료 후 질문할 수 있습니다.",
+        locked,
+        locked,
+        locked,
+        locked
+    )
+
+
+def register_pdf(pdf_paths, request: gr.Request):
+
+    if not pdf_paths:
+        return None, "⚠️ PDF 파일을 선택해주세요."
+
+    if not OPENAI_API_KEY:
+        return (
+            None,
+            "⚠️ OPENAI_API_KEY가 없습니다. .env 파일을 확인해주세요."
+        )
+
+    # 여러 PDF를 하나의 DB로 처리
+    db, message = build_db(pdf_paths, OPENAI_API_KEY)
+
+    if db is not None:
+        with _session_lock(request):
+            _session_dbs[request.session_hash] = db
+
+    return db, message
+
+
+def finish_register(db):
+
+    can_ask = gr.update(interactive=db is not None)
+
+    return (
+        can_ask,
+        can_ask,
+        gr.update(interactive=True),
+        gr.update(interactive=True)
+    )
+
+
+# ==========================================
+# 5. 질문 및 스트리밍 답변
+# ==========================================
+
+def ask_question(question, history, db, request: gr.Request):
+
+    history = list(history or [])
+    prior_history = list(history)
+
+    if not question or not question.strip():
+        history.append({
+            "role": "assistant",
+            "content": "⚠️ 질문을 입력해주세요."
+        })
+        yield history, ""
+        return
+
+    history.append({
+        "role": "user",
+        "content": question
+    })
+
+    with _session_lock(request):
+
+        if db is None or db is not _session_dbs.get(request.session_hash):
+            history.append({
+                "role": "assistant",
+                "content": "⚠️ PDF를 선택한 뒤 파일 등록 버튼을 눌러주세요."
+            })
+            yield history, ""
+            return
+
+        history.append({
+            "role": "assistant",
+            "content": "🤖 답변을 생성하는 중..."
+        })
+        yield history, ""
+
+        try:
+            result = answer(
+                question,
+                OPENAI_API_KEY,
+                db,
+                prior_history
+            )
+
+            if isinstance(result, str):
+                history[-1]["content"] = result
+                yield history, ""
+
+            else:
+                for text in result:
+                    history[-1]["content"] = str(text)
+                    yield history, ""
+
+        except Exception as e:
+            history[-1]["content"] = f"⚠️ 답변 처리 오류: {e}"
+            yield history, ""
+
+
+def clear_chat():
+    return []
+
+
+def cleanup_session(request: gr.Request):
+
+    with _session_lock(request):
+        _delete_db(
+            _session_dbs.pop(request.session_hash, None)
+        )
+
+    with _sessions_guard:
+        _session_locks.pop(request.session_hash, None)
+
+
+# ==========================================
+# 6. Gradio Blocks UI
+# ==========================================
+
+with gr.Blocks(title="문서 질의응답 서비스") as demo:
+
+    db_state = gr.State(value=None)
+    selected_files = gr.State(value=None)
+
+    with gr.Column(elem_id="main-card"):
+
+        # 제목 + 다크모드
+        with gr.Row(elem_id="title-row"):
+
+            with gr.Column(scale=5, min_width=180):
+                gr.HTML("""
+                <div class="page-title">
+                    📚 문서 질의응답 서비스
+                </div>
+                """)
+
+            with gr.Column(scale=1, min_width=110):
+                dark_mode = gr.Checkbox(
+                    label="🌙 다크모드",
+                    value=False,
+                    container=False,
+                    elem_id="mode-select"
+                )
+
+        gr.HTML('<div class="gradient-line"></div>')
+
+        # PDF 다중 업로드
+        gr.HTML(
+            '<div class="section-label">📚 PDF 다중 문서 업로드</div>'
+        )
+
+        with gr.Row(elem_id="file-row"):
+
+            pdf_file = gr.UploadButton(
+                "📎 PDF 여러 개 선택",
+                file_types=[".pdf"],
+                file_count="multiple",
+                type="filepath",
+                variant="secondary",
+                scale=5,
+                min_width=160,
+                elem_id="pdf-select"
+            )
+
+            upload_btn = gr.Button(
+                "📂 파일 등록",
+                variant="secondary",
+                scale=2,
+                min_width=95,
+                elem_id="upload-btn"
+            )
+
+        status = gr.Markdown(
+            "📁 등록된 문서가 없습니다.",
+            elem_id="upload-status"
+        )
+
+        # 질문
+        gr.HTML(
+            '<div class="section-label">💬 질문</div>'
+        )
+
+        question = gr.Textbox(
+            placeholder="💬 여러 PDF 문서에 대해 질문하세요...",
+            show_label=False,
+            container=False,
+            lines=1,
+            max_lines=5,
+            interactive=False,
+            elem_id="question-box"
+        )
+
+        ask_btn = gr.Button(
+            "🚀 질문하기 →",
+            variant="primary",
+            interactive=False,
+            elem_id="ask-btn"
+        )
+
+        # AI 대화
+        gr.HTML(
+            '<div class="section-label">✨ AI 대화</div>'
+        )
+
+        chatbot = gr.Chatbot(
+            placeholder="🤖 질문을 입력하면 이곳에 대화가 쌓입니다.",
+            show_label=False,
+            layout="bubble",
+            height=400,
+            elem_id="chat-box"
+        )
+
+        # 대화 초기화
+        clear_btn = gr.Button(
+            "🗑️ 대화 초기화",
+            variant="secondary",
+            elem_id="clear-btn"
+        )
+
+    # ======================================
+    # 7. 이벤트 핸들러
+    # ======================================
+
+    pdf_file.upload(
+        fn=select_pdf,
+        inputs=[pdf_file],
+        outputs=[selected_files, status]
+    )
+
+    upload_btn.click(
+        fn=start_register,
+        outputs=[
+            db_state,
+            status,
+            question,
+            ask_btn,
+            pdf_file,
+            upload_btn
+        ]
+    ).then(
+        fn=register_pdf,
+        inputs=[selected_files],
+        outputs=[db_state, status]
+    ).then(
+        fn=finish_register,
+        inputs=[db_state],
+        outputs=[
+            question,
+            ask_btn,
+            pdf_file,
+            upload_btn
+        ]
+    )
+
+    ask_btn.click(
+        fn=ask_question,
+        inputs=[question, chatbot, db_state],
+        outputs=[chatbot, question]
+    )
+
+    question.submit(
+        fn=ask_question,
+        inputs=[question, chatbot, db_state],
+        outputs=[chatbot, question]
+    )
+
+    clear_btn.click(
+        fn=clear_chat,
+        outputs=chatbot
+    )
+
+    demo.unload(cleanup_session)
+
+
+# ==========================================
+# 8. 서버 실행
+# ==========================================
+
+if __name__ == "__main__":
+    demo.launch(
+        css=CSS,
+        theme=gr.themes.Soft()
+    )
