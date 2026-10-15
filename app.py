@@ -1,6 +1,9 @@
 # ===== Step 1. PDF 처리 (feature/pdf-processing) =====
+import hashlib
 import logging
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -10,9 +13,6 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 import request_log
 import base64
-import os
-import tempfile
-from concurrent.futures import ThreadPoolExecutor
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
@@ -25,13 +25,18 @@ except ImportError:
     logging.getLogger(__name__).warning("pymupdf가 없어 표·이미지 청킹을 건너뜁니다. pip install -r requirements.txt")
 
 NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
-VISUAL_MAX_WORKERS = 4                                    # 표·이미지 요약 GPT 호출 동시 실행 수
-IMAGE_SAVE_DIR = os.path.join(tempfile.gettempdir(), "chatpdf_images")  # 추출 이미지 저장 위치 (프로젝트 폴더 밖)
 
+# 시각 청킹 비용·시간 상한 (#74)
+# - 35쪽 PDF에서 표·이미지마다 순서대로 호출해 등록이 145초 걸렸음 → 상한·중복 제거·병렬 호출
+MAX_VISION_CALLS = 20        # PDF 하나당 GPT 호출(이미지 분석·표 요약) 최대 횟수. 넘는 요소는 건너뜀
+VISION_MAX_WORKERS = 4       # 동시에 보내는 호출 수(속도 제한에 걸리지 않을 정도로 작게)
+MIN_IMAGE_SIDE = 120         # 가로·세로가 이보다 작은 이미지는 아이콘·로고로 보고 제외
+MIN_IMAGE_BYTES = 4096       # 파일이 이보다 작은 큰 이미지는 단색 띠·배경 장식(실측 650~1,900바이트)으로 보고 제외
+MAX_IMAGE_ASPECT = 5         # 가로:세로(또는 세로:가로)가 이보다 길쭉하면 구분선·띠 장식으로 보고 제외
+# 표는 to_markdown 원문이 이미 수치를 그대로 담고, 같은 내용이 텍스트 청크·페이지 원문(#37)에도 있어
+# GPT 요약은 기본으로 끔. 켜면 표 요약도 MAX_VISION_CALLS 안에서 함께 처리됨
+SUMMARIZE_TABLES = False
 
-def _visual_chunks_enabled():
-    """.env의 VISUAL_CHUNKS=0/false/off 이면 표·이미지 청킹(GPT 호출)을 건너뜀. 기본은 사용."""
-    return os.getenv("VISUAL_CHUNKS", "1").strip().lower() not in ("0", "false", "off", "no")
 
 # ==========================================
 # 표 / 이미지 전담 청킹 클래스 정의
@@ -39,19 +44,14 @@ def _visual_chunks_enabled():
 class VisualElementChunker:
     """PDF 내에서 일반 텍스트는 건너뛰고, '표(Table)'와 '이미지/차트(Image)'만 전담으로 추출 및 요약 청킹"""
 
-    def __init__(
-        self,
-        api_key: str,
-        model_name: str = "gpt-4o-mini",
-        image_save_dir: str = IMAGE_SAVE_DIR,
-    ):
+    def __init__(self, api_key: str, model_name: str = "gpt-4o-mini"):
+        self.model_name = model_name
         self.llm = ChatOpenAI(model=model_name, temperature=0.0, api_key=api_key)
-        self.image_save_dir = image_save_dir
-        os.makedirs(self.image_save_dir, exist_ok=True)
 
-    def _summarize_image(self, image_path: str) -> str:
-        with open(image_path, "rb") as f:
-            b64_image = base64.b64encode(f.read()).decode("utf-8")
+    def _summarize_image(self, image_bytes: bytes, ext: str = "png", config=None) -> str:
+        # 이미지는 파일로 저장하지 않고 메모리에서 바로 보냄 (#74: ./extracted_images가 계속 쌓이던 문제)
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        mime = "jpeg" if ext in ("jpg", "jpeg") else ext
 
         prompt = """
         당신은 데이터 시각화 및 문서 분석 전문가입니다.
@@ -66,14 +66,14 @@ class VisualElementChunker:
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+                    "image_url": {"url": f"data:image/{mime};base64,{b64_image}"},
                 },
             ]
         )
-        response = self.llm.invoke([message])
+        response = self.llm.invoke([message], config=config)
         return response.content
 
-    def _summarize_table(self, table_markdown: str) -> str:
+    def _summarize_table(self, table_markdown: str, config=None) -> str:
         prompt = f"""
         다음 표의 구조와 수치 데이터를 분석하여 핵심 요약문을 작성하세요.
         사용자가 자연어로 검색할 때 이 표가 잘 검색될 수 있도록 주요 항목명, 수치, 결론을 포함하세요.
@@ -81,58 +81,125 @@ class VisualElementChunker:
         [표 데이터]
         {table_markdown}
         """
-        response = self.llm.invoke(prompt)
+        response = self.llm.invoke(prompt, config=config)
         return response.content
 
+    @staticmethod
+    def _is_decorative(base_image) -> bool:
+        """아이콘·로고·구분선·단색 배경처럼 내용이 없는 이미지인지 (#74)"""
+        width, height = base_image["width"], base_image["height"]
+        if width < MIN_IMAGE_SIDE or height < MIN_IMAGE_SIDE:
+            return True
+        if len(base_image["image"]) < MIN_IMAGE_BYTES:
+            return True
+        return max(width, height) / min(width, height) > MAX_IMAGE_ASPECT
+
     def extract_visual_chunks(self, pdf_path: str, filename: str) -> list[Document]:
-        """표·이미지를 찾아 GPT 요약 청크로 만듦.
-        1) 페이지를 돌며 표·이미지를 먼저 모으고 → 2) GPT 요약을 동시에 실행(VISUAL_MAX_WORKERS개씩)
-        → 3) 원래 순서(페이지 순, 페이지 안에서는 표 → 이미지)대로 청크를 만듦."""
+        started = time.perf_counter()
+        stats = dict(tables=0, images=0, vision_calls=0, skipped_decorative=0,
+                     skipped_duplicate=0, skipped_cap=0, failed=0)
+        # 페이지 순서대로 만들 청크 목록: (GPT 호출 종류 "image"·"table" 또는 호출 없음 None, 입력, 메타데이터)
+        jobs = []
+        seen_xrefs, seen_hashes = set(), set()
         doc = fitz.open(pdf_path)
-        items = []                                        # (종류, 페이지, 번호, 요약할 내용, 추가 메타데이터)
         try:
             for page_idx in range(len(doc)):
                 page = doc[page_idx]
                 page_num = page_idx  # 0-based page index
 
                 # 1. 표(Table) 추출
-                for t_idx, table in enumerate(page.find_tables()):
+                tabs = page.find_tables()
+                for t_idx, table in enumerate(tabs):
                     df = table.to_pandas()
                     if df.empty or df.shape[0] < 1:
                         continue
                     table_md = df.to_markdown(index=False)
-                    items.append(("table", page_num, t_idx, table_md, {"table_index": t_idx, "raw_table_md": table_md}))
+                    metadata = {
+                        "element_type": "table",
+                        "page": page_num,
+                        "source_filename": filename,
+                        "source": str(pdf_path),
+                        "table_index": t_idx,
+                        "raw_table_md": table_md,
+                    }
+                    stats["tables"] += 1
+                    jobs.append(("table" if SUMMARIZE_TABLES else None, table_md, metadata))
 
-                # 2. 이미지/차트(Image) 추출
+                # 2. 이미지/차트(Image) 추출. 같은 이미지(xref·내용)가 여러 페이지에 반복되면 한 번만 (#74)
                 for img_idx, img_info in enumerate(page.get_images(full=True)):
-                    base_image = doc.extract_image(img_info[0])
-                    if base_image["width"] < 120 or base_image["height"] < 120:
+                    xref = img_info[0]
+                    if xref in seen_xrefs:
+                        stats["skipped_duplicate"] += 1
                         continue
-                    img_filename = f"page_{page_num + 1}_img_{img_idx}_{uuid.uuid4().hex[:6]}.{base_image['ext']}"
-                    img_filepath = os.path.join(self.image_save_dir, img_filename)
-                    with open(img_filepath, "wb") as f:
-                        f.write(base_image["image"])
-                    items.append(("image", page_num, img_idx, img_filepath, {"image_path": img_filepath}))
+                    seen_xrefs.add(xref)
+                    base_image = doc.extract_image(xref)
+                    if self._is_decorative(base_image):
+                        stats["skipped_decorative"] += 1
+                        continue
+                    digest = hashlib.sha1(base_image["image"]).hexdigest()
+                    if digest in seen_hashes:
+                        stats["skipped_duplicate"] += 1
+                        continue
+                    seen_hashes.add(digest)
+                    metadata = {
+                        "element_type": "image",
+                        "page": page_num,
+                        "source_filename": filename,
+                        "source": str(pdf_path),
+                        "image_index": img_idx,
+                        "image_xref": xref,
+                    }
+                    jobs.append(("image", (base_image["image"], base_image["ext"]), metadata))
         finally:
             doc.close()
 
-        def summarize(item):
-            kind, _, _, content, _ = item
-            return self._summarize_table(content) if kind == "table" else self._summarize_image(content)
+        # PDF당 호출 상한: 페이지 앞쪽부터 상한까지만 호출하고 나머지 이미지는 청크를 만들지 않음 (#74)
+        calls = 0
+        kept = []
+        for job in jobs:
+            if job[0] is not None:
+                if calls >= MAX_VISION_CALLS:
+                    if job[0] == "image":
+                        stats["skipped_cap"] += 1
+                        continue
+                    job = (None,) + job[1:]  # 상한을 넘은 표는 요약 없이 원문만 둠
+                else:
+                    calls += 1
+            kept.append(job)
 
-        # GPT 요약을 동시에 실행. map은 입력 순서대로 결과를 돌려주고, 하나라도 실패하면 예외가 그대로 올라감 (기존과 동일)
-        with ThreadPoolExecutor(max_workers=VISUAL_MAX_WORKERS) as pool:
-            summaries = list(pool.map(summarize, items))
+        # 호출은 몇 개씩 동시에 보내고, 결과는 원래 순서대로 모음. 하나가 실패해도 나머지는 등록 (#74, #65)
+        trace = request_log.current()   # 작업 스레드에는 요청 로그 컨텍스트가 넘어가지 않아 미리 잡아 둠
+        config = {"callbacks": [request_log.TokenUsageCallback(trace, self.model_name)]} if trace else None
+
+        def run(job):
+            """(청크 내용, 실패 여부). 표는 요약이 실패해도 원문은 남기고, 이미지는 건너뜀"""
+            kind, payload, metadata = job
+            try:
+                if kind == "image":
+                    return f"[이미지/차트 분석]\n{self._summarize_image(*payload, config=config)}", False
+                if kind == "table":
+                    return f"[표 데이터 요약]\n{self._summarize_table(payload, config=config)}\n\n[원본 표]\n{payload}", False
+            except Exception as error:
+                logging.getLogger(__name__).warning("시각 요소 분석 실패(%s p.%s): %s",
+                                                    filename, metadata["page"] + 1, error)
+                return (None if kind == "image" else f"[원본 표]\n{payload}"), True
+            return f"[원본 표]\n{payload}", False
+
+        with ThreadPoolExecutor(max_workers=VISION_MAX_WORKERS) as pool:
+            results = list(pool.map(run, kept))
 
         visual_chunks: list[Document] = []
-        for (kind, page_num, _, content, extra), summary in zip(items, summaries):
-            page_content = (f"[표 데이터 요약]\n{summary}\n\n[원본 표]\n{content}" if kind == "table"
-                            else f"[이미지/차트 분석]\n{summary}")
-            visual_chunks.append(Document(
-                page_content=page_content,
-                metadata={"element_type": kind, "page": page_num, "source_filename": filename,
-                          "source": str(pdf_path), **extra},
-            ))
+        for (kind, _, metadata), (content, failed) in zip(kept, results):
+            stats["vision_calls"] += kind is not None
+            stats["failed"] += failed
+            if content is None:
+                continue
+            stats["images"] += metadata["element_type"] == "image"
+            visual_chunks.append(Document(page_content=content, metadata=metadata))
+
+        if trace:
+            trace.emit("visual_chunks", filename=filename, chunks=len(visual_chunks),
+                       seconds=round(time.perf_counter() - started, 4), **stats)
         return visual_chunks
 
 def _layout_page_texts(pdf_path, pages):
@@ -190,7 +257,7 @@ def _build_db(pdf_paths, openai_key):
     page_count = 0
     # 시각 청킹 준비가 실패해도 텍스트 청크만으로 등록을 이어감 (#65)
     visual_chunker = None
-    if fitz is not None and _visual_chunks_enabled():
+    if fitz is not None:
         try:
             visual_chunker = VisualElementChunker(api_key=openai_key)
         except Exception as error:
@@ -207,7 +274,9 @@ def _build_db(pdf_paths, openai_key):
                 visual_chunks = []
                 if visual_chunker is not None:
                     try:
-                        visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
+                        # 시각 청킹 시간·호출 수·토큰을 요청 로그에 따로 남김 (#74)
+                        with request_log.stage("visual_chunking"):
+                            visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
                     except Exception as ve:
                         logging.getLogger(__name__).warning("시각 청크 추출 실패(%s): %s", filename, ve)
 
@@ -266,7 +335,7 @@ def _build_db(pdf_paths, openai_key):
 import re                        # 정규표현식: 파일 경로에서 파일 이름 자르기, 문장 나누기, 질문 단어 뽑기에 사용
 import time                      # 답변에 걸린 시간(초)을 잴 때 사용
 import weakref                   # DB 객체가 사라지는 순간을 감지해서 그 DB의 캐시를 지울 때 사용
-
+from pathlib import Path        # 파일 경로를 운영체제(Windows/Linux)에 상관없이 다루는 도구
 
 # ---------- 외부 패키지 (requirements.txt로 설치됨) ----------
 import gradio as gr              # 웹 화면 라이브러리. 여기서는 gr.Error로 화면에 오류 메시지를 띄우는 데 사용
@@ -276,7 +345,7 @@ from langchain.retrievers.multi_query import MultiQueryRetriever         # 질�
 from langchain_core.documents import Document                                     # 페이지 단위로 이어 붙인 근거를 담는 문서 객체
 from langchain_core.output_parsers import StrOutputParser                        # GPT 응답 객체에서 '글자(문자열)'만 꺼내주는 도구
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate            # GPT에게 보낼 지시문(프롬프트) 틀을 만드는 도구
-# ChatOpenAI(GPT 호출 도구)는 Step 1 import를 같이 사용
+from langchain_openai import ChatOpenAI                                          # LangChain에서 GPT 모델을 부르는 도구
 
 # ---------- 설정값 (숫자만 바꾸면 동작이 바뀜) ----------
 MODEL_NAME = "gpt-4o-mini"       # 사용할 GPT 모델 이름
@@ -291,15 +360,16 @@ EVIDENCE_MAX_CHARS = 150         # [근거 원문] 조각 1개당 최대 글자 
 EVIDENCE_MAX_SENTENCES = 2       # [근거 원문] 조각 1개에서 뽑을 최대 문장 수
 
 # ---------- 검색 방식 설정 ----------
-# 이 값 하나만 바꾸면 검색 방식이 바뀜
-#   "similarity"        : 질문과 가장 비슷한 조각 TOP_K개 (기본 방식)
+# 이 값 하나만 바꾸면 검색 방식이 바뀜 (비교 실험: eval/compare_retrievers.py, 결과는 README)
+#   "similarity"        : 질문과 가장 비슷한 조각 TOP_K개
 #   "mmr"               : 비슷하면서도 내용이 겹치지 않는 조각 TOP_K개
-#   "multiquery"        : 질문을 3개로 바꿔 각각 검색 (GPT 1회 추가)
-#   "multiquery_rerank" : multiquery + GPT가 순위 재정렬 (GPT 2회 추가)
+#   "multiquery"        : 질문을 3개로 바꿔 MMR로 각각 검색 (GPT 1회 추가)
+#   "multiquery_rerank" : multiquery + GPT가 순위 재정렬 (GPT 2회 추가, 기본값)
 SEARCH_MODES = ("similarity", "mmr", "multiquery", "multiquery_rerank")
-SEARCH_MODE = "multiquery_rerank"  # 비교 실험 후 최종 결정
+SEARCH_MODE = "multiquery_rerank"
 
-_answer_cache = {}               # 답변 캐시: {(PDF 고유 이름, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
+_answer_cache = {}               # 답변 캐시: {(PDF 컬렉션 이름, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
+_db_files_cache = {}             # DB별 등록 파일 이름 목록: {PDF 컬렉션 이름: [파일명, ...]}
 _watched_db_keys = set()         # 사라지면 캐시를 지우도록 등록해 둔 DB 이름 목록 (중복 등록 방지)
 _dead_db_keys = set()            # 이미 사라진 DB 이름 목록. 다음 캐시 사용 때 그 DB의 캐시를 지움
 
@@ -331,7 +401,8 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
      "규칙:\n"
      "1. 아래 [문서] 내용만 근거로 한국어로 답하세요.\n"                            # 근거 제한
      "2. 문서에 없는 내용은 추측하지 말고 '문서에서 확인할 수 없습니다'라고 답하세요.\n"  # 모르면 모른다고
-     "3. 수치는 문서 표현 그대로 쓰고, 근거 문장 끝에 (p.페이지) 형식으로 표시하세요.\n"  # 출처 표시
+     "3. 수치는 문서 표현 그대로 쓰고, 근거 문장 끝에 (p.페이지) 형식으로 표시하세요. "
+     "[문서]에 파일이 여럿이면 (파일명 p.페이지)로 표시하세요.\n"                    # 출처 표시
      "4. 핵심부터 간결하게 답하세요.\n"                                           # 답변 스타일
      "5. 표: 행(항목)과 열(연도·기간)을 맞춰 읽고, 비교·증감 질문은 해당 수치를 직접 비교해 답하세요. "
      "표에 필요한 수치가 있으면 '확인할 수 없다'고 하지 마세요. 일부만 확인되면 확인되는 부분은 답하고 "
@@ -340,11 +411,14 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
      "원문 명칭 그대로 나열하세요. 문서에 없는 항목은 만들지 마세요.\n"               # 목록 완전성 (#37)
      "7. 공통점: 여러 대상의 '공통' 특징을 물으면 모든 대상에 실제로 나타나는 것만 공통이라고 하세요. "
      "일부 대상에만 해당하면 대상별로 구분해 쓰고, 공통 요소가 없으면 없다고 답하세요.\n"  # 잘못된 일반화 방지 (#37)
-     "8. 표가 글자로 풀려 열(대상) 구분이 불분명하면 단정하지 말고 그 한계를 밝히세요.\n\n"
+     "8. 표가 글자로 풀려 열(대상) 구분이 불분명하면 단정하지 말고 그 한계를 밝히세요.\n"
+     "9. 여러 문서: 문서·보고서끼리 비교하거나 '각각' 묻는 질문은 [문서]의 [파일명 p.N] 표시로 문서를 구분해 "
+     "문서별 근거를 먼저 정리한 뒤 비교하세요. 질문한 문서마다 답하고, 특정 문서에 근거가 없으면 그 문서만 "
+     "확인할 수 없다고 밝히세요. 대상·기간·기준이 다른 수치는 직접 비교의 한계를 밝히고, 문서에 없는 "
+     "인과관계나 연결은 만들지 마세요.\n\n"                                         # 여러 문서 비교·종합 (#59)
      "[문서]\n{context}"),                                                        # {context}에 검색된 PDF 내용이 들어감
     ("human", "{question}"),                                                      # {question}에 사용자 질문이 들어감
 ])
-
 
 # ---------- [근거 원문]용 질문 단어 처리 ----------
 # 질문에서 '의미 없는 말'(조사, 질문 표현)을 빼고 핵심 단어만 남기려는 목록
@@ -358,63 +432,44 @@ _PARTICLES = sorted(["에서는", "으로는", "에서", "으로", "에는", "�
                     key=len, reverse=True)
 
 
-def _page_number(meta):
-    """실제 PDF 페이지 번호(1부터). loader의 page는 0부터 시작하므로 +1. 없으면 '?'."""
-    page = meta.get("page")                                     # 컴퓨터식 페이지 번호(0부터 시작)
-    if isinstance(page, int) and not isinstance(page, bool):    # 정수일 때만 (True/False 같은 값은 제외)
-        return str(page + 1)                                    # 사람식(1부터 시작)으로 바꾸려고 1을 더함
-    return "?"                                                  # 페이지 정보가 아예 없으면 물음표 표시
-
-
-def _printed_label(meta):
-    """PDF에 인쇄된 페이지 라벨(예: 'iv', '12'). 없으면 None. 실제 페이지 번호와는 별개로 취급."""
-    label = meta.get("page_label")                              # PDF 안에 적힌 쪽번호 표기
-    return str(label) if label else None                        # 있으면 글자로, 없으면 None
+def _page_label(meta):
+    """PDF 조각의 정보(meta)에서 사람이 보는 페이지 번호를 꺼냄.
+    README 기준대로 실제 PDF 페이지 번호(page + 1)를 우선함 (#28). 인쇄된 라벨('iv' 등)은 page가 없을 때만 사용."""
+    if isinstance(meta.get("page"), int):   # 컴퓨터식 페이지 번호(0부터 시작)가 있으면
+        return str(meta["page"] + 1)        #   사람식(1부터 시작)으로 바꾸려고 1을 더함
+    if meta.get("page_label"):              # 없으면 PDF에 인쇄된 페이지 번호(예: 'iv', '12')를 사용
+        return str(meta["page_label"])
+    return "?"                              # 페이지 정보가 아예 없으면 물음표 표시
 
 
 def _source_name(meta):
-    """출처 파일명. 업로드 원본 이름(source_filename)을 우선, 없으면 source 경로의 파일명, 둘 다 없으면 '문서'."""
-    name = meta.get("source_filename")                          # 사용자가 올린 원래 파일 이름 (최우선)
-    if not name:                                                # 없으면 저장 경로에서 파일 이름만 꺼냄
-        # 경로 'C:\data\report.pdf' 또는 '/tmp/report.pdf'에서 'report.pdf'만 꺼냄 (\ 와 / 모두 처리)
-        name = re.split(r"[\\/]", meta.get("source") or "")[-1]
-    return name or "문서"                                        # 그래도 비어 있으면 '문서'
-
-
-def _page_label(meta):
-    """(develop #28·#49 호환) 화면에 쓰는 페이지 번호. 실제 PDF 페이지(page + 1)를 우선하고,
-    page가 없을 때만 인쇄 라벨('iv' 등), 둘 다 없으면 '?'."""
-    page = _page_number(meta)                                   # 실제 PDF 페이지 (없으면 '?')
-    if page != "?":
-        return page
-    return _printed_label(meta) or "?"                          # page가 없으면 인쇄 라벨로 대체
+    """PDF 조각의 원본 파일 이름. build_db가 저장한 source_filename을 우선하고, 없으면 source 경로에서 꺼냄 (#28)."""
+    if meta.get("source_filename"):
+        return str(meta["source_filename"])
+    # 경로 'C:\data\report.pdf' 또는 '/tmp/report.pdf'에서 'report.pdf'만 꺼냄 (\ 와 / 모두 처리)
+    return re.split(r"[\\/]", meta.get("source") or "")[-1] or "문서"
 
 
 def _format_docs(docs):
-    """검색된 PDF 조각들을 GPT에게 보낼 하나의 글로 합침. 조각마다 [p.실제페이지]를 앞에 붙임."""
+    """검색된 PDF 조각들을 GPT에게 보낼 하나의 글로 합침. 조각마다 [파일명 p.페이지]를 앞에 붙임.
+    여러 PDF를 함께 등록했을 때 GPT가 어느 내용이 어느 문서인지 구분할 수 있게 파일명을 넣음 (#59)."""
     return "\n\n".join(                                         # 조각 사이를 빈 줄로 구분해서 이어 붙임
-        f"[p.{_page_number(d.metadata)}] {d.page_content}"      # 예: "[p.3] 2026년 성장률은 ..."
+        f"[{_source_name(d.metadata)} p.{_page_label(d.metadata)}] {d.page_content}"  # 예: "[report.pdf p.3] 2026년 성장률은 ..."
         for d in docs                                           # 검색된 조각을 하나씩 처리
     )
 
 
 def _format_sources(docs):
-    """답변 아래에 붙일 '참고' 문구를 만듦. 예: '참고: report.pdf (p.2, 5 (인쇄 iv), 7)'
-    p.뒤 숫자는 실제 PDF 페이지, 인쇄 라벨은 실제 페이지와 다를 때만 (인쇄 ...)로 따로 표시."""
-    pages = {}                                                  # {파일이름: {페이지: 인쇄라벨 또는 None}}을 담을 빈 상자
+    """답변 아래에 붙일 '참고 페이지' 문구를 만듦. 예: '참고: report.pdf (p.2, 5, 7)'"""
+    pages = {}                                                  # {파일이름: [페이지 목록]}을 담을 빈 상자
     for d in docs:                                              # 조각을 하나씩 보면서
-        entry = pages.setdefault(_source_name(d.metadata), {})  # 이 파일의 페이지 목록 (원본 파일명 우선)
-        page = _page_number(d.metadata)                         # 실제 PDF 페이지
-        label = _printed_label(d.metadata)                      # 인쇄된 페이지 라벨
-        if label == page:                                       # 실제 페이지와 같으면 따로 보여줄 필요 없음
-            label = None
-        if entry.get(page) is None:                             # 같은 페이지 중복 제거, 라벨이 있으면 보존
-            entry[page] = label
-    sort_key = lambda p: (0, int(p)) if p.isdigit() else (1, p)  # 숫자 페이지는 숫자 순서로, '?' 같은 건 뒤로 정렬
-    parts = []                                                  # 파일마다 한 덩어리씩 담을 목록
-    for name, entry in pages.items():
-        items = sorted(entry, key=sort_key)                     # develop #28 기준: 실제 PDF 페이지만 표시 (인쇄 라벨 생략)
-        parts.append(f"{name} (p.{', '.join(items)})")          # 예: "report.pdf (p.2, 5 (인쇄 iv))"
+        name = _source_name(d.metadata)                         # 원본 파일 이름 (예: report.pdf)
+        label = _page_label(d.metadata)                         # 이 조각의 페이지 번호
+        if label not in pages.setdefault(name, []):             # 같은 파일·같은 페이지가 이미 있으면 건너뜀 (중복 제거)
+            pages[name].append(label)                           # 처음 나온 페이지만 목록에 추가
+    sort_key = lambda p: (0, int(p)) if p.isdigit() else (1, p)  # 숫자 페이지는 숫자 순서로, 'iv' 같은 건 뒤로 정렬
+    parts = [f"{name} (p.{', '.join(sorted(ps, key=sort_key))})"  # 파일마다 "report.pdf (p.2, 5)" 형태로 만듦
+             for name, ps in pages.items()]
     return "\n\n---\n**참고**: " + " / ".join(parts)              # 구분선(---) 아래에 굵은 글씨 '참고'로 표시
 
 
@@ -435,7 +490,7 @@ def _keywords(question):
 
 
 def _split_sentences(text):
-    """조각 글을 문장 목록으로 나눔. 줄바꿈·연속 공백은 한 칸 공백으로 정리(글자는 고치지 않음).
+    """글을 문장 목록으로 나눔. 줄바꿈·연속 공백은 한 칸 공백으로 정리(글자는 고치지 않음).
     '2.1%'처럼 마침표 뒤에 공백이 없는 숫자는 나누지 않고, '다. ' 처럼 마침표+공백에서 나눔.
     보고서의 글머리 기호(○ ▪ ■ 등) 앞에서도 나눔."""
     text = re.sub(r"\s+", " ", text or "").strip()              # 줄바꿈·탭·여러 칸 공백 → 공백 한 칸
@@ -443,15 +498,51 @@ def _split_sentences(text):
     return [s.strip() for s in parts if s and s.strip()]        # 빈 조각 제거
 
 
+_EVIDENCE_SKIP = ("목 차", "목차", "비상업 목적", "인용 또는 전재", "문의는 아래")  # 근거로 보여주지 않을 머리말·안내문 표시
+
+
+def _is_toc_page(text):
+    """목차 페이지인지: 앞쪽 줄에 '목 차'가 있거나 '·····' 점선 줄이 여럿이면 목차로 봄."""
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return any(l.replace(" ", "") == "목차" for l in lines[:5]) or sum("·····" in l for l in lines) >= 2
+
+
+def _clean_page_lines(text, header_lines, page=None):
+    """페이지 글에서 반복 머리말(보고서 제목 줄)·쪽번호·'EXECUTIVE SUMMARY' 같은 줄을 빼고 돌려줌 (#76).
+    줄 단위로 거른 뒤에 문장으로 나눠야 '제목 24 ․ 본문'처럼 머리말이 문장 앞에 붙지 않음.
+    3쪽부터는 첫 줄이 짧고 문장으로 끝나지 않으면 보고서 제목 머리말로 보고 뺌."""
+    kept = []
+    first = True                                                # 페이지의 첫 글자 줄인지 (머리말 후보는 첫 줄 하나뿐)
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_first, first = first, False
+        if stripped in header_lines:
+            continue
+        if (is_first and isinstance(page, int) and page >= 2 and len(stripped) <= 80
+                and not stripped.endswith((".", "다", "음", "함", "임"))):
+            continue                                            # 각 쪽 맨 위 보고서 제목 줄
+        if re.fullmatch(r"[0-9ivxlcdmIVXLCDM]+", stripped):    # 쪽번호만 있는 줄 (1, 24, iii 등)
+            continue
+        if re.fullmatch(r"EXECUTIVE\s*SUMMARY", stripped, re.IGNORECASE):
+            continue
+        kept.append(stripped)
+    return "\n".join(kept)
+
+
 def _pick_evidence(text, keywords):
-    """조각에서 질문 단어가 가장 많이 들어간 문장 1~2개를 골라 하나의 글로 돌려줌. 없으면 ''."""
-    sentences = _split_sentences(text)                          # 문장으로 나눔
+    """글에서 질문 단어가 가장 많이 들어간 문장 1~2개를 골라 하나의 글로 돌려줌. 질문 단어가 든 문장이 없으면 ''."""
+    sentences = [s for s in _split_sentences(text)
+                 if not any(mark in s for mark in _EVIDENCE_SKIP)]  # 목차·저작권 안내 문장 제외 (#76)
     if not sentences:                                           # 글이 비어 있으면
         return ""                                               #   근거 없음
     compact = [s.replace(" ", "").lower() for s in sentences]   # 띄어쓰기 차이('경제 성장률' vs '경제성장률')를 무시하려고 공백 제거본으로 비교
     scores = [sum(k in c for k in keywords) for c in compact]   # 문장마다 '질문 단어가 몇 개 들어 있는지' 점수
     ranked = sorted(range(len(sentences)), key=lambda i: (-scores[i], i))  # 점수 높은 순, 같으면 앞 문장 먼저
-    chosen = [ranked[0]]                                        # 1등 문장은 무조건 선택 (점수가 전부 0이면 첫 문장이 됨)
+    if scores[ranked[0]] == 0:                                  # 질문 단어가 든 문장이 하나도 없으면
+        return ""                                               #   엉뚱한 첫 문장을 근거로 보여주지 않음 (#76)
+    chosen = [ranked[0]]                                        # 1등 문장 선택
     for i in ranked[1:EVIDENCE_MAX_SENTENCES]:                  # 다음 순위 문장들도 후보
         if scores[i] > 0 and len(" ".join(sentences[j] for j in sorted(chosen + [i]))) <= EVIDENCE_MAX_CHARS:
             chosen.append(i)                                    #   질문 단어가 있고, 합쳐도 글자 수 제한 안이면 추가
@@ -466,22 +557,54 @@ def _escape_md(text):
     return re.sub(r"([\\*_`~<>])", r"\\\1", text)
 
 
-def _format_evidence(docs, question):
+def _is_refusal(answer_text):
+    """'문서에서 확인할 수 없습니다'만 답한 경우인지 (이때는 근거 원문을 붙이지 않음)."""
+    body = (answer_text or "").strip()
+    return body.startswith("문서에서 확인할 수 없습니다") and len(body) < 60
+
+
+def _format_evidence(docs, question, answer_text=""):
     """[근거 원문] 답변 아래에 붙일 PDF 원문 발췌를 만듦. GPT 추가 호출 없음.
     예)  **근거 원문**
          > [보고서.pdf p.3] "2026년 경제성장률은 2.1%로 전망된다..."
-    - 조각마다 질문 단어가 가장 많이 든 문장 1~2개, 최대 150자
-    - 같은 파일·같은 페이지는 1번만, 최대 3개
+    - 조각(또는 페이지)마다 질문 단어가 가장 많이 든 문장 1~2개, 최대 150자
+    - 같은 파일·같은 페이지는 1번만, 최대 3개. 페이지 표시는 '참고'와 같은 _page_label 기준 (#28)
     - 보여줄 근거가 하나도 없으면 빈 글자('')를 돌려줘서 칸 자체를 표시하지 않음"""
-    keywords = _keywords(question)                              # 질문의 핵심 단어
+    if _is_refusal(answer_text):                                # 답을 못 찾았다고 했으면 근거도 보여주지 않음 (#76)
+        return ""
+    # 질문 단어 + 답변 본문 단어로 문장을 고름: '각각'·비교 질문처럼 질문 단어가 일반적일 때도
+    # 답변이 실제로 말한 내용과 맞는 문장이 문서마다 골라지게 함 (#76)
+    keywords = _keywords(question)
+    # 답변 속 출처 표기([파일명 p.N])·숫자만 있는 단어는 문서 어디에나 있어 순위를 흐리므로 제외
+    answer_body = re.sub(r"[\[(][^\])]*p\.\s*\d+[^\])]*[\])]", " ", answer_text or "")
+    keywords += [k for k in _keywords(answer_body)
+                 if k not in keywords and not k.isdigit() and k != "pdf"][:20]
+    # 표·이미지 설명(시각 청크)의 마크다운 표·'###' 요약은 근거 문장으로 쓰지 않음 (#76).
+    # 페이지 원문(page_text)이 있으면 그 페이지의 원문 문장에서 고르고, 없으면 제외
+    docs = [d for d in docs if not d.metadata.get("element_type") or d.metadata.get("page_text")]
+    # 여러 페이지 첫 줄에 반복되는 보고서 제목은 머리말로 보고 뺌
+    first_lines = [((d.metadata.get("page_text") or d.page_content or "").strip().splitlines() or [""])[0].strip()
+                   for d in docs]
+    header_lines = {line for line in first_lines if line and first_lines.count(line) >= 2}
+    # 여러 PDF면 파일마다 한 번씩 번갈아 고르도록 순서를 바꿈 (한 문서에 근거가 몰리는 것 방지, #59)
+    by_file = {}
+    for d in docs:
+        by_file.setdefault(_source_name(d.metadata), []).append(d)
+    ordered = [d for group in zip(*by_file.values()) for d in group] if len(by_file) > 1 else docs
+    ordered += [d for d in docs if d not in ordered]
     seen = set()                                                # 이미 보여준 (파일, 페이지) 기록
     lines = []                                                  # 화면에 보여줄 줄 목록
-    for d in docs:                                              # 검색된 조각을 (관련도 순서대로) 하나씩 보면서
+    for d in ordered:                                           # 검색된 조각을 (관련도 순서대로) 하나씩 보면서
         name = _source_name(d.metadata)                         # 원본 파일명
-        page = _page_number(d.metadata)                         # 실제 PDF 페이지 (뷰어 번호와 동일)
+        page = _page_label(d.metadata)                          # 실제 PDF 페이지 (뷰어 번호와 동일)
         if page != "?" and (name, page) in seen:                # 같은 페이지는 이미 보여줬으면 건너뜀
             continue
-        snippet = _pick_evidence(d.page_content, keywords)      # 이 조각에서 근거 문장 고르기
+        # 조각 경계에서 문장이 잘리지 않게 페이지 전체(#37 page_text)에서 문장을 고름. 목차 페이지는 건너뜀
+        raw = d.metadata.get("page_text") or d.page_content
+        if _is_toc_page(raw):
+            continue
+        text = _clean_page_lines(raw, header_lines, d.metadata.get("page"))
+        snippet = _pick_evidence(text, keywords)                # 이 페이지에서 근거 문장 고르기
         if not snippet:                                         # 고를 글이 없으면 건너뜀
             continue
         seen.add((name, page))
@@ -493,113 +616,122 @@ def _format_evidence(docs, question):
     return "\n\n**근거 원문**\n" + "\n>\n".join(lines)           # 항목 사이는 빈 인용줄(>)로 띄워서 따로 보이게 함
 
 
-def _rerank_checked(llm, docs, query, k=None):
-    """검색된 조각 중 질문과 가장 관련 있는 k개를 GPT가 골라 순서를 다시 매김.
-    반환: (조각 목록, 재정렬 성공 여부)
-    """
-    # k를 안 주면 설정값 TOP_K 사용
-    k = k or TOP_K
-
-    # 조각이 이미 k개 이하면 고를 필요 없음 (API 호출 절약)
-    if len(docs) <= k:
-        return docs, True
-
+def _rerank_checked(llm, docs, query, top_n=TOP_K):
+    """[업그레이드 1] 검색된 조각들 중 질문과 가장 관련 있는 top_n개를 GPT가 골라 순서를 다시 매김.
+    반환: (조각 목록, 재정렬 성공 여부). 실패하면 원래 순서의 앞 top_n개와 False (#49 rerank_fallback 기록)."""
+    if len(docs) <= top_n:                                      # 조각이 이미 top_n개 이하면 고를 필요가 없으니
+        return docs, True                                       #   그대로 돌려줌 (API 호출 절약)
     try:
-        with request_log.stage("rerank"):                       # [#49] 요청 로그에 재정렬 단계 기록
-            reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=k)
+        with request_log.stage("rerank"):
+            reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=top_n)
             ranked = list(reranker.compress_documents(docs, query))
-        if ranked:
-            return ranked, True
-        # 결과가 비면 원래 순서의 앞 k개 사용 (실패로 기록)
-        return docs[:k], False
-    except Exception:
-        # 오류가 나도 답변은 계속되도록 원래 순서의 앞 k개 사용 (실패로 기록)
-        if request_log.current():                               # [#49] 요청 로그에 대체 사용 기록
-            request_log.current().emit("rerank_fallback", status="fallback")
-        return docs[:k], False
+    except Exception:                                           # 재정렬 중 어떤 오류가 나도
+        ranked = []                                             #   아래에서 실패로 처리
+    if ranked:
+        return ranked, True
+    if request_log.current():                                   # 오류이거나 결과가 비었으면
+        request_log.current().emit("rerank_fallback", status="fallback")
+    return docs[:top_n], False                                  #   답변은 계속되도록 원래 순서의 앞 top_n개를 사용
 
 
-def _rerank(llm, docs, query, k=None):
-    """(develop #49 호환) 재정렬 결과 목록만 돌려줌. 성공 여부까지 필요하면 _rerank_checked 사용."""
-    return _rerank_checked(llm, docs, query, k)[0]
+def _rerank(llm, docs, query, top_n=TOP_K):
+    """재정렬된 조각 목록만 돌려줌 (성공 여부가 필요하면 _rerank_checked 사용)."""
+    return _rerank_checked(llm, docs, query, top_n)[0]
+
+
+def _db_files(db):
+    """DB에 등록된 원본 파일 이름 목록 (컬렉션별로 한 번만 조회)."""
+    key = _cache_key(db)
+    if key not in _db_files_cache:
+        try:
+            metadatas = db.get(include=["metadatas"])["metadatas"]
+            _db_files_cache[key] = sorted({_source_name(m) for m in metadatas if m})
+        except Exception:
+            return []
+    return _db_files_cache[key]
+
+
+def _chunk_key(doc):
+    return doc.metadata.get("chunk_id") or (_source_name(doc.metadata), doc.metadata.get("page"), doc.page_content)
+
+
+def _add_file_candidates(db, docs, query, files):
+    """[#59] 여러 PDF가 등록돼 있으면 파일마다 관련 조각을 2개씩 더 찾아 후보에 넣음.
+    전체 검색만 하면 내용이 많은 한 문서가 후보를 독차지해 다른 문서가 비교·종합에서 빠지기 때문."""
+    seen = {_chunk_key(d) for d in docs}
+    candidates = list(docs)
+    for name in files:
+        try:
+            found = db.max_marginal_relevance_search(query, k=2, fetch_k=8, filter={"source_filename": name})
+        except Exception:
+            continue
+        for doc in found:
+            if _chunk_key(doc) not in seen:
+                seen.add(_chunk_key(doc))
+                candidates.append(doc)
+    return candidates
+
+
+def _cover_files(ranked, candidates, files, k=None):
+    """[#59] 재정렬 상위 k개(기본 TOP_K)에 없는 파일이 있으면, 그 파일에서 가장 순위가 높은 조각을 1개씩 보충함.
+    한 문서만 근거로 쓰여 '각각'·'비교' 질문에서 다른 문서가 빠지는 문제를 막음."""
+    k = k or TOP_K
+    ordered = list(ranked) + [d for d in candidates if d not in ranked]
+    picked = list(ranked[:k])
+    covered = {_source_name(d.metadata) for d in picked}
+    for doc in ordered[k:]:
+        name = _source_name(doc.metadata)
+        if name in files and name not in covered:
+            picked.append(doc)
+            covered.add(name)
+    return picked
 
 
 def _retrieve(db, llm, query, mode=None, k=None):
-    """[검색 방식 변경] SEARCH_MODE에 맞는 방식으로 PDF 조각을 찾음.
+    """[검색 방식 선택] SEARCH_MODE에 맞는 방식으로 PDF 조각을 찾음.
     반환: (조각 목록, 재정렬 성공 여부). 재정렬을 안 하는 방식이면 None.
     answer()와 비교 실험 스크립트(eval/compare_retrievers.py)가 같이 씀.
-    """
-    # 값을 안 주면 설정값 사용
+    여러 PDF가 등록돼 있으면 방식과 관계없이 파일별 후보 추가·빠진 파일 보충을 함 (#59)."""
     mode = mode or SEARCH_MODE
     k = k or TOP_K
     if mode not in SEARCH_MODES:
         raise ValueError(f"알 수 없는 검색 방식: {mode} (가능: {SEARCH_MODES})")
 
-    # 1) 기본 검색기 만들기
+    # 1) 기본 검색기: similarity는 가장 비슷한 k개, 나머지는 MMR(후보 k×5개 중 서로 겹치지 않게 k개)
     if mode == "similarity":
-        # 질문과 가장 비슷한 k개
-        base = db.as_retriever(search_kwargs={"k": k})
+        retriever = db.as_retriever(search_kwargs={"k": k})
     else:
-        # MMR: 후보 k×5개 중 서로 겹치지 않게 k개
-        base = db.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": k * 5})
-
-    # 2) similarity, mmr은 여기서 끝
-    if mode in ("similarity", "mmr"):
-        return base.invoke(query), None
-
-    # 3) 멀티쿼리: 질문을 3개로 바꿔 원래 질문까지 총 4번 검색 (중복은 자동 제거)
-    retriever = MultiQueryRetriever.from_llm(
-        retriever=base,
-        llm=llm,
-        prompt=MULTI_QUERY_PROMPT,
-        include_original=True,
-    )
-    docs = retriever.invoke(query)
-
-    if mode == "multiquery":
-        return docs[:k], None
-
-    # 4) 재정렬: 후보 k×2개 중 GPT가 k개를 고름
-    return _rerank_checked(llm, docs[: k * 2], query, k)
-
-
-def _db_key(db):
-    """[버그 수정] 캐시에서 PDF DB를 구분하는 고유 이름.
-    예전에는 id(db)(메모리 주소)를 썼는데, DB를 버리고 새 DB를 만들면
-    파이썬이 같은 주소를 다시 줄 수 있어서 이전 PDF의 답변이 나오는 문제가 있었음.
-    → Step 1이 업로드마다 새로 만드는 고유 컬렉션 이름(pdf_<uuid>)을 사용.
-    (db._collection은 DB 삭제 후 오류가 나므로, 삭제 후에도 남는 _collection_name을 씀)
-    """
-    return getattr(db, "_collection_name", None) or id(db)    # 이름이 없는 DB만 예전처럼 id 사용
-
-
-def _remove_cache_of(key):
-    """key(DB 이름)에 해당하는 캐시를 모두 지우고, 지운 개수를 돌려줌."""
-    old = [k for k in list(_answer_cache) if k[0] == key]        # 이 DB로 저장된 (DB 이름, 질문) 목록
-    for k in old:
-        _answer_cache.pop(k, None)                               # 하나씩 삭제 (이미 없으면 무시)
-    return len(old)
-
-
-def _purge_dead_caches():
-    """사라진 DB들의 캐시를 정리함. 캐시를 읽거나 쓰기 직전에 매번 호출."""
-    while _dead_db_keys:                                         # 정리할 DB가 남아 있는 동안
-        key = _dead_db_keys.pop()                                #   하나 꺼내서
-        _remove_cache_of(key)                                    #   그 DB의 캐시 삭제
-        _watched_db_keys.discard(key)                            #   감시 목록에서도 제거
-
-
-def _watch_db(db, key):
-    """DB 객체가 사라지면(새 PDF 등록으로 버려지는 경우 등) 그 DB 이름을 '정리 대상'에 넣도록 등록.
-    여기서 바로 지우지 않는 이유: 객체가 사라지는 시점은 예측할 수 없어서,
-    캐시를 사용하는 도중에 지우면 오류가 날 수 있음 → 다음 캐시 사용 때 안전하게 정리."""
-    if key in _watched_db_keys:                                  # 이미 등록했으면
-        return                                                   #   다시 등록하지 않음
+        retriever = db.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": k * 5})
+    if mode.startswith("multiquery"):                           # 2) 멀티쿼리: 질문을 3개로 바꿔 원래 질문까지 총 4번 검색
+        retriever = MultiQueryRetriever.from_llm(
+            retriever=retriever,                                # 실제 검색은 위의 MMR 검색기가 담당
+            llm=llm,                                            # 질문 3개를 만드는 데 GPT 사용
+            prompt=MULTI_QUERY_PROMPT,                          # 한국어 질문을 만들도록 직접 만든 프롬프트 사용
+            include_original=True,                              # 바꾼 질문 3개 + 원래 질문까지 총 4번 검색
+        )
+    trace = request_log.current()
     try:
-        weakref.finalize(db, _dead_db_keys.add, key)             # db가 사라지는 순간 key를 정리 대상에 추가
-        _watched_db_keys.add(key)
-    except TypeError:                                            # 감시할 수 없는 객체면 (드묾)
-        pass                                                     #   자동 정리만 생략 (캐시 구분은 정상 동작)
+        with request_log.stage("retrieval"):
+            # 재정렬할 방식은 후보 k×2개, 아니면 k개 (중복은 MultiQueryRetriever가 자동 제거)
+            docs = retriever.invoke(query)[: k * 2 if mode == "multiquery_rerank" else k]
+            _log_documents(db, docs)
+    finally:
+        if trace:
+            trace.usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
+                        stage="retrieval_embeddings")
+
+    rerank = mode == "multiquery_rerank"
+    files = _db_files(db)
+    if len(files) > 1:                                          # [#59] 여러 PDF: 파일별 후보 추가 → 전체 순위 → 빠진 파일 보충
+        candidates = _add_file_candidates(db, docs, query, files)
+        ranked, ok = candidates, None
+        if rerank:
+            # top_n을 후보 수보다 작게 해야 실제로 재정렬됨 (같거나 크면 재정렬을 건너뜀)
+            ranked, ok = _rerank_checked(llm, candidates, query, top_n=k + len(files))
+        return _cover_files(ranked, candidates, files, k), ok
+    if rerank:
+        return _rerank_checked(llm, docs, query, top_n=k)       # [업그레이드 1] k×2개 중 가장 관련 있는 k개로 추림
+    return docs, None
 
 
 def _cache_key(db):
@@ -607,38 +739,60 @@ def _cache_key(db):
     return getattr(db, "_collection_name", None) or id(db)       # build_db가 만든 컬렉션 이름: pdf_<uuid>
 
 
+def _remove_cache_of(key):
+    """key(DB 컬렉션 이름)로 저장된 답변·등록 파일 목록 캐시를 지우고, 지운 답변 개수를 돌려줌."""
+    old = [k for k in list(_answer_cache) if k[0] == key]       # 이 DB로 저장된 (DB 이름, 질문) 목록
+    for cache_key in old:
+        _answer_cache.pop(cache_key, None)                      # 하나씩 삭제 (이미 없으면 무시)
+    _db_files_cache.pop(key, None)                              # 등록 파일 목록 캐시도 정리 (#59)
+    return len(old)
+
+
+def _purge_dead_caches():
+    """사라진 DB들의 캐시를 정리함. 캐시를 읽거나 쓰기 직전에 매번 호출."""
+    while _dead_db_keys:                                        # 정리할 DB가 남아 있는 동안
+        key = _dead_db_keys.pop()                               #   하나 꺼내서
+        _remove_cache_of(key)                                   #   그 DB의 캐시 삭제
+        _watched_db_keys.discard(key)                           #   감시 목록에서도 제거
+
+
+def _watch_db(db, key):
+    """DB 객체가 사라지면(새 PDF 등록으로 버려지는 경우 등) 그 DB 이름을 '정리 대상'에 넣도록 등록.
+    객체가 사라지는 시점은 예측할 수 없어서 여기서 바로 지우지 않고, 다음 캐시 사용 때 안전하게 정리함."""
+    if key in _watched_db_keys:                                 # 이미 등록했으면 다시 등록하지 않음
+        return
+    try:
+        weakref.finalize(db, _dead_db_keys.add, key)            # db가 사라지는 순간 key를 정리 대상에 추가
+        _watched_db_keys.add(key)
+    except TypeError:                                           # 감시할 수 없는 객체면 (드묾)
+        pass                                                    #   자동 정리만 생략 (캐시 구분은 정상 동작)
+
+
 def _cache_get(db, query):
     """[업그레이드 2] 같은 PDF(db)에 같은 질문(query)을 한 적이 있으면 저장해 둔 답변을 꺼냄. 없으면 None."""
-    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
-    return _answer_cache.get((_db_key(db), query))               # (PDF 고유 이름, 질문)으로 저장된 답변 찾기
+    _purge_dead_caches()                                        # 사라진 DB의 캐시부터 정리
+    return _answer_cache.get((_cache_key(db), query))
 
 
 def _cache_put(db, query, text):
     """[업그레이드 2] 새로 만든 답변을 캐시에 저장함."""
-    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
-    if len(_answer_cache) >= CACHE_SIZE:                         # 캐시가 가득 찼으면
-        _answer_cache.pop(next(iter(_answer_cache)))             #   가장 먼저 저장된(가장 오래된) 답변 1개를 지움
-    key = _db_key(db)                                            # 이 PDF의 고유 이름
-    _answer_cache[(key, query)] = text                           # (PDF 고유 이름, 질문)을 열쇠로 답변을 저장
-    _watch_db(db, key)                                           # 이 DB가 사라지면 캐시가 자동 정리되도록 등록
+    _purge_dead_caches()                                        # 사라진 DB의 캐시부터 정리
+    if len(_answer_cache) >= CACHE_SIZE:                        # 캐시가 가득 찼으면
+        _answer_cache.pop(next(iter(_answer_cache)))            #   가장 먼저 저장된(가장 오래된) 답변 1개를 지움
+    key = _cache_key(db)
+    _answer_cache[(key, query)] = text                          # (PDF 컬렉션 이름, 질문)을 열쇠로 답변을 저장
+    _watch_db(db, key)                                          # 이 DB가 사라지면 캐시가 자동 정리되도록 등록
 
 
-def clear_answer_cache(db=None):
-    """[버그 수정 · 화면 팀 호출용] 캐시를 직접 정리함.
-    db를 주면 그 PDF의 캐시만, 안 주면 전체 캐시를 지움. 반환: 지운 개수.
-    DB를 직접 삭제할 때(old_db.delete_collection()) 그 전에 호출하면 됨.
-    """
-    _purge_dead_caches()                                         # 사라진 DB의 캐시부터 정리
-    if db is None:                                               # 전체 삭제
+def _cache_clear(db=None):
+    """DB를 삭제·교체할 때 그 DB로 만든 답변을 캐시에서 지움 (#24). db를 안 주면 전체 삭제. 반환: 지운 답변 개수."""
+    _purge_dead_caches()
+    if db is None:
         count = len(_answer_cache)
         _answer_cache.clear()
+        _db_files_cache.clear()
         return count
-    return _remove_cache_of(_db_key(db))                         # 이 PDF의 캐시만 삭제
-
-
-def _cache_clear(db):
-    """(develop #24 호환) 화면의 _delete_db()가 DB를 지우기 전에 호출. 그 DB의 캐시만 지움."""
-    clear_answer_cache(db)
+    return _remove_cache_of(_cache_key(db))
 
 
 def _log(**record):
@@ -689,6 +843,7 @@ def _history_to_text(history):
             content = item.get("content", "")                   # 실제 대화 내용
             if isinstance(content, list):                       # 이미지 등이 섞인 형식이면 (내용이 목록으로 옴)
                 content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))  # 글자 부분만 이어 붙임
+            content = str(content).split("\n\n---\n")[0]       # 답변 아래 '참고'·'근거 원문'은 빼고 본문만 (#76: 후속 질문 재작성 방해)
             lines.append(f"{role}: {content}")                  # 예: "사용자: 성장률은?"
         elif isinstance(item, (list, tuple)) and len(item) == 2:  # 예전 Gradio 형식: [질문, 답변]
             lines.append(f"사용자: {item[0]}")                   # 첫 번째는 사용자 질문
@@ -741,22 +896,19 @@ def _answer(question, openai_key, db, history=None):
         # ===== 3단계: [업그레이드 2] 캐시 확인 =====
         cached = _cache_get(db, search_question)                # 같은 질문에 대한 저장된 답변이 있는지 확인
         if cached:                                              # 있으면
-            trace.status = "cached"                             # [#49] 요청 로그: 캐시 응답
-            _log(question=question, search_question=search_question, cached=True,
+            trace.status = "cached"
+            _log(question=question, search_question=search_question, cached=True,  # 캐시로 답했다고 기록
                  mode=SEARCH_MODE,
-                 seconds=round(time.perf_counter() - start, 2))
+                 seconds=round(time.perf_counter() - start, 2))  # 걸린 시간(초, 소수점 둘째 자리까지)
             yield cached                                        # 저장된 답변을 바로 화면에 보여주고
             return                                              # 함수 끝 (검색·GPT 호출 생략 → 빠르고 비용 0)
 
         # ===== 4단계: PDF에서 관련 내용 검색 (방식은 SEARCH_MODE 설정을 따름) =====
-        try:
-            with request_log.stage("retrieval"):                # [#49] 요청 로그: 검색 단계
-                docs, rerank_ok = _retrieve(db, llm, search_question)
-        finally:
-            trace.usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
-                        stage="retrieval_embeddings")
-        with request_log.stage("selected_context"):             # [#49] 최종 선택된 조각 기록
+        # 검색(retrieval) → [#59] 여러 PDF면 파일별 후보 추가 → [업그레이드 1] 재정렬 → 빠진 파일 보충
+        docs, rerank_ok = _retrieve(db, llm, search_question)
+        with request_log.stage("selected_context"):
             _log_documents(db, docs)
+        selected = docs                                         # 페이지로 넓히기 전 조각 (근거 원문용)
         with request_log.stage("page_context"):                 # [#37] 고른 조각을 페이지 전체로 넓힘
             docs = _expand_to_pages(docs)
             if trace:
@@ -779,16 +931,21 @@ def _answer(question, openai_key, db, history=None):
                 yield text
 
         # ===== 6단계: 참고 페이지 + 근거 원문 붙이기 =====
-        final = (text + _format_sources(docs)                   # 완성된 답변 아래에 '참고: report.pdf (p.2, 5)' 추가
-                 + _format_evidence(docs, search_question))     # [기능 추가] 그 아래에 '근거 원문' 추가 (근거가 없으면 빈 글자)
+        # 근거 원문은 페이지 전체가 아니라 검색이 고른 조각(selected)에서 뽑음 → 질문과 맞는 문장이 더 정확히 나옴
+        # (글자 수 상한으로 GPT에 못 넘긴 페이지의 조각은 제외 → '참고' 페이지와 항상 일치)
+        sent = {(_source_name(d.metadata), d.metadata.get("page")) for d in docs}
+        evidence_docs = [d for d in selected if (_source_name(d.metadata), d.metadata.get("page")) in sent]
+        sources = "" if _is_refusal(text) else _format_sources(docs)  # 답을 못 찾았으면 '참고'도 붙이지 않음 (#76)
+        final = (text + sources                                 # 완성된 답변 아래에 '참고: report.pdf (p.2, 5)' 추가
+                 + _format_evidence(evidence_docs, search_question, text))  # 그 아래에 '근거 원문' 추가 (근거가 없으면 빈 글자)
         yield final                                             # 최종 답변을 화면에 표시
 
         # ===== 7단계: [업그레이드 2, 3] 캐시 저장 + 성능 기록 =====
         _cache_put(db, search_question, final)                  # 다음에 같은 질문이 오면 바로 답하도록 저장 (근거 원문 포함)
-        _log(question=question, search_question=search_question, cached=False,
-             mode=SEARCH_MODE, rerank_ok=rerank_ok,
-             seconds=round(time.perf_counter() - start, 2),
-             pages=[_page_number(d.metadata) for d in docs])    # 답변 근거로 쓴 실제 PDF 페이지 목록
+        _log(question=question, search_question=search_question, cached=False,  # 새로 답변했다고 기록
+             mode=SEARCH_MODE, rerank_ok=rerank_ok,             # 검색 방식, 재정렬 성공 여부 (재정렬을 안 하는 방식이면 None)
+             seconds=round(time.perf_counter() - start, 2),     # 전체 걸린 시간(초)
+             pages=[_page_label(d.metadata) for d in docs])     # 답변 근거로 쓴 페이지 목록
 
     # ===== 오류 처리: OpenAI 오류를 사용자가 이해할 수 있는 한국어로 안내 =====
     except openai.AuthenticationError as error:                          # API 키가 틀렸거나 만료된 경우
@@ -810,10 +967,15 @@ def _answer(question, openai_key, db, history=None):
 
 # ===== Step 3. 화면 (feature/chat-ui) =====
 
-# os·base64·tempfile·Path(Step 1), gradio(Step 2)는 위 구역의 import를 같이 사용
+import os
+import base64
+import html
+import tempfile
 import threading
 from copy import deepcopy
+from pathlib import Path
 
+import gradio as gr
 from dotenv import load_dotenv
 
 
@@ -834,20 +996,41 @@ _sessions_guard = threading.Lock()
 # 2. 팀 로고 불러오기
 # ==========================================
 
+# 원본 hyundap_logo.png(1254×1254, 1.2MB)를 base64로 그대로 넣으면 HTML과 /config에
+# 두 번 실려 첫 로드가 약 3.4MB였음. 또 Hugging Face Spaces는 일반 git으로 push한
+# 바이너리 파일을 거부함 → 화면 표시 크기(27~36px)의 2배인 72×72로 줄이고 64색으로
+# 압축한 PNG(948 bytes)를 문자열로 코드에 직접 넣고, 이미지 파일은 저장소에서 뺌 (#60)
+LOGO_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEgAAABICAMAAABiM0N1AAAAwFBMVEX9/f0YlFQJjUgIRynK"
+    "19Hl7Ol+w6AYVDfP5NqGpZcAPBwyZ06Jyah1mYhXg26YsqY3o2tNe2W6zMTZ6+JouZBIqnci"
+    "mFuku7AkXEGz3MdCdFwrnWFjjHk+cFl5wZ1ZsoSvxLqj1bshWj674M6RrqBqkX8ALAqb0bYA"
+    "PyDe8Od/opIAhj5Tr4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAVEFlRAAAAQHRSTlP/////////////////////////////////"
+    "//////////////////////////8AAAAAAAAAAAAAAAAAAAAAAAAAFPfcwQAAAmNJREFUeNrt"
+    "lWt3oyAQhpGBghfiJcZbLk2aJm139///vh3QJpp6opGcPfvB94MI4iMD74yEzJo163/Rn/Q5"
+    "nJI68imgteNEz+Ck1HFoYM85Okb2wUU1aGXL2dEaZBucdC5aWoFWFw59teEE9LoiepjOWTpt"
+    "WZhpRdugcjLn0ObQj+kLytqcwC43LhxTAMrAIjdqjjH2VzbJTFELtP4eWdlZqE5ZUwYONhai"
+    "5ZWcWVioPrBje9cfWJDUMudGd2bg4oXjY+VVNuvKmmSNpmVKSpvp6+YmpZOsWTrfC5Hrrx9H"
+    "+ICZopsPl50qQEeb6YV26323mow3k+zY+cbjzgNmWt0U11d6Cxpnpg/aPZ/gB2fkby7rzi/7"
+    "OGPMlDpZO+uXfRh0x6CZDr/pVXjSEV56NRRcsAtergp2nW7rQTr9V/DvxdjgFM5GHDsXYjAZ"
+    "Q28xAvQmBufko0Diba9UQkIXQ2RuzhS2octzN9HDSNm4LixMi4+5m+83SvavCFCJOseExGfl"
+    "nhUhvsd8PQo52XgAAkELT/cr9onXT9Gzr7yAd65ggXvFuQAeei6CgMWg+C9YMPCZrGCT6DbG"
+    "vhB6etwXWoEhwRY/GYZeTNwGVMESh2PT3Xsn0yYGjC8JcQeE3/RhjyDVrEjWIKVP7fRu2gYk"
+    "9Ts9m12DyBb0pASKUOGNb0AVhuK6AjYSTBszgDisvFMPyPc1CIPOAUIcUOBBsSdbgSBRkVx4"
+    "4ONmh3XLoMCbuPf8ub5o20HBTclN2GUYLxy7y6aVHEPjyd1c4JXQ2zCYUGaz75Z+EBvyDBBh"
+    "/Fk5PmvWrKv+Aq3BHimNNcEpAAAAAElFTkSuQmCC"
+)
+
+
 def get_logo_html():
-    logo_path = Path(__file__).with_name("hyundap_logo.png")
-
-    if logo_path.exists():
-        encoded = base64.b64encode(
-            logo_path.read_bytes()
-        ).decode("utf-8")
-
+    if LOGO_PNG_BASE64:
         return (
             '<img class="team-logo" '
-            f'src="data:image/png;base64,{encoded}" '
+            f'src="data:image/png;base64,{LOGO_PNG_BASE64}" '
             'alt="hyundap 로고">'
         )
 
+    # 로고 데이터가 없으면 책 아이콘으로 대체
     return '<span class="logo-fallback">📚</span>'
 
 
@@ -942,10 +1125,26 @@ footer {
    상단 로고 + 제목
 ========================= */
 
+/* 제목 줄: 두 칸 너비를 Gradio 기본(flex: 1, 최소 210px+100px)이 아닌 실제 내용 폭으로 계산하고
+   줄바꿈을 허용 → 좁은 화면(320·375px)에서 제목과 토글이 한 줄에 안 들어가면
+   토글이 제목 아래 줄로 내려가 카드 밖으로 잘리지 않음 (#75) */
 #title-row {
     align-items: center !important;
-    flex-wrap: nowrap !important;
+    flex-wrap: wrap !important;
     gap: 8px !important;
+}
+
+#title-col {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+}
+
+#mode-col {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    margin-left: auto !important;
 }
 
 .brand-header {
@@ -985,6 +1184,8 @@ footer {
     border: none !important;
     padding: 0 !important;
     min-width: 0 !important;
+    width: auto !important;
+    overflow: visible !important;   /* 라벨 글자가 상자 밖에서 잘리지 않게 (#75) */
 }
 
 #mode-select label,
@@ -1156,11 +1357,13 @@ footer {
     background: var(--chat-bg) !important;
 }
 
-/* 사용자 말풍선 */
+/* 사용자 말풍선
+   흰 글자 대비가 #6478ed에서 3.85:1로 부족해 같은 계열의 더 진한 파랑으로 바꿈
+   → 5.00:1(WCAG AA 4.5:1 이상), 라이트·다크 공통 (#63) */
 
 #chat-box .message.user,
 #chat-box .message.user.message {
-    background: #6478ed !important;
+    background: #5064dc !important;
     color: #ffffff !important;
     border: none !important;
     border-radius: 16px !important;
@@ -1437,23 +1640,12 @@ footer {
     }
 }
 
-/* 320px: 제목 줄이 넘쳐 다크모드 토글이 카드 밖으로 잘리던 문제 */
+/* 320px: 제목 글자를 조금 줄이고, 그래도 넘치면 제목 안에서 줄바꿈
+   (토글 줄바꿈은 위 #title-row 규칙이 처리, #75) */
 @media (max-width: 360px) {
-    #title-row {
-        flex-wrap: wrap !important;
-    }
-
-    #title-row > * {
-        min-width: 0 !important;
-    }
-
     .page-title {
         white-space: normal;
         font-size: 15px;
-    }
-
-    #mode-select {
-        max-width: 100% !important;
     }
 }
 """
@@ -1557,6 +1749,21 @@ QUESTION_PROCESSING = "⏳ PDF 처리 중입니다. 완료되면 질문할 수 �
 QUESTION_NOT_REGISTERED = "🔒 등록된 PDF가 없어 질문할 수 없습니다. 위 안내를 확인하고 PDF를 다시 등록해 주세요."
 REGISTER_FAILED_NOTE = "\n\n🔒 PDF 등록에 성공해야 질문할 수 있습니다."
 
+def lock_register():
+    # 클릭 즉시(queue=False) 등록·선택 버튼과 질문을 잠가 연타로 등록이 여러 번 실행되지 않게 함 (#62)
+    # DB 삭제처럼 시간이 걸리는 작업은 다음 단계(start_register)에서 처리
+    locked = gr.update(interactive=False)
+
+    return (
+        QUESTION_PROCESSING,
+        gr.update(interactive=False, placeholder=QUESTION_PROCESSING),
+        locked,                                                  # 질문하기
+        locked,                                                  # PDF 선택
+        locked,                                                  # 파일 등록
+        locked                                                   # 선택 초기화
+    )
+
+
 def start_register(request: gr.Request):
 
     with _session_lock(request):
@@ -1656,6 +1863,44 @@ def finish_register(db, message, pdf_paths):
 # 6. 질문 및 스트리밍 답변
 # ==========================================
 
+# 답변 생성 중에는 다음 질문·대화 초기화를 막아 순서 섞임·중복 요청·추가 비용을 방지 (#62, #61)
+QUESTION_ANSWERING = "⏳ 답변을 생성하는 중입니다. 완료되면 다음 질문을 할 수 있습니다."
+
+def start_answer():
+    # 질문 전송 즉시(queue=False) 질문창·질문하기와 DB/대화를 바꾸는 버튼을 잠금 (#62)
+    # 질문창은 value를 건드리지 않아야 다음 단계(ask_question)가 입력한 질문을 그대로 받음
+    locked = gr.update(interactive=False)
+
+    return (
+        gr.update(interactive=False, placeholder=QUESTION_ANSWERING),
+        locked,                                                  # 질문하기
+        locked,                                                  # PDF 선택
+        locked,                                                  # 파일 등록
+        locked,                                                  # 선택 초기화
+        locked,                                                  # 대화 초기화 (#61)
+        locked,                                                  # 이전 기록
+        locked                                                   # TXT 다운로드
+    )
+
+
+def finish_answer(db):
+    # 답변이 끝나면(오류로 끝나도) 등록된 DB가 있을 때만 질문을 다시 허용 (#62, #55)
+    can_ask = db is not None
+    placeholder = QUESTION_READY if can_ask else QUESTION_NO_PDF
+    unlocked = gr.update(interactive=True)
+
+    return (
+        gr.update(interactive=can_ask, placeholder=placeholder),
+        gr.update(interactive=can_ask),
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked
+    )
+
+
 def ask_question(question, history, db, request: gr.Request):
     with request_log.request(LOG_PATH, "qa", secrets=(OPENAI_API_KEY,), activate=False) as trace:
         yield from request_log.iterate(trace, _ask_question(question, history, db, request))
@@ -1666,14 +1911,20 @@ def _ask_question(question, history, db, request):
     history = list(history or [])
     prior_history = deepcopy(history)
 
+    # 입력 오류는 예외를 던지지 않고 안내만 함: 예외가 나면 뒤이은 잠금 해제(finish_answer)가 실행되지 않아
+    # 화면이 잠긴 채 남음 (#62). 빈 질문은 대화에 말풍선을 남기지 않음
     if not question or not question.strip():
         request_log.current().status = "error"
         request_log.current().emit("validation_failed", reason="empty_question")
-        history.append({
-            "role": "assistant",
-            "content": "⚠️ 질문을 입력해주세요."
-        })
-        yield history, ""
+        gr.Warning("질문을 입력해주세요.", title="안내")
+        yield prior_history, ""
+        return
+
+    if len(question.strip()) > MAX_QUESTION_LEN:
+        request_log.current().status = "error"
+        request_log.current().emit("validation_failed", reason="question_too_long")
+        gr.Warning(f"질문은 {MAX_QUESTION_LEN}자 이내로 입력하세요.", title="안내")
+        yield prior_history, question                   # 고쳐 쓸 수 있게 질문을 질문창에 되돌려 줌
         return
 
     history.append({
@@ -1718,8 +1969,11 @@ def _ask_question(question, history, db, request):
                     history[-1]["content"] = str(text)
                     yield history, ""
 
-        except gr.Error:
-            raise
+        except gr.Error as e:
+            # API 키·사용 한도·연결 오류 등도 대화에 안내하고 끝내야 잠금이 풀림 (#62)
+            request_log.current().status = "error"
+            history[-1]["content"] = f"⚠️ {e.message}"
+            yield history, ""
 
         except Exception as e:
             request_log.current().status = "error"
@@ -1854,6 +2108,8 @@ def create_chat_txt(history):
         content = _message_text(
             message.get("content", "")
         )
+        # 화면 표시용으로 붙인 마크다운 \ 이스케이프(근거 원문의 \_ \~ 등)는 TXT에서 원래 글자로 되돌림 (#76)
+        content = re.sub(r"\\([\\*_`~<>])", r"\1", content)
 
         lines.append(
             "[질문]" if role == "user"
@@ -1922,7 +2178,8 @@ with gr.Blocks(
 
             with gr.Column(
                 scale=6,
-                min_width=210
+                min_width=210,
+                elem_id="title-col"
             ):
 
                 gr.HTML(f"""
@@ -1936,7 +2193,8 @@ with gr.Blocks(
 
             with gr.Column(
                 scale=1,
-                min_width=100
+                min_width=100,
+                elem_id="mode-col"
             ):
 
                 dark_mode = gr.Checkbox(
@@ -2113,8 +2371,19 @@ with gr.Blocks(
         outputs=[selected_files, status]
     )
 
-    # PDF 처리 시작
+    # PDF 처리 시작: 즉시 잠금 → 이전 DB 정리 → 등록 → 결과·잠금 해제 (#62)
     upload_btn.click(
+        fn=lock_register,
+        outputs=[
+            status,
+            question,
+            send_btn,
+            pdf_file,
+            upload_btn,
+            reset_select_btn
+        ],
+        queue=False
+    ).then(
         fn=start_register,
         outputs=[
             db_state,
@@ -2143,33 +2412,41 @@ with gr.Blocks(
         ]
     )
 
-    # 질문하기
-    send_btn.click(
-        fn=ask_question,
-        inputs=[
-            question,
-            chatbot,
-            db_state
-        ],
-        outputs=[
-            chatbot,
-            question
-        ]
-    )
+    # 질문하기(➤) / Enter 전송: 잠금 → 스트리밍 답변 → 잠금 해제 (#62, #61)
+    # 잠금 해제는 .then이라 ask_question이 gr.Error로 끝나도 실행됨
+    answer_lock_outputs = [
+        question,
+        send_btn,
+        pdf_file,
+        upload_btn,
+        reset_select_btn,
+        clear_btn,
+        history_menu,
+        download_btn
+    ]
 
-    # Enter 전송
-    question.submit(
-        fn=ask_question,
-        inputs=[
-            question,
-            chatbot,
-            db_state
-        ],
-        outputs=[
-            chatbot,
-            question
-        ]
-    )
+    for trigger in (send_btn.click, question.submit):
+        trigger(
+            fn=start_answer,
+            outputs=answer_lock_outputs,
+            queue=False
+        ).then(
+            fn=ask_question,
+            inputs=[
+                question,
+                chatbot,
+                db_state
+            ],
+            outputs=[
+                chatbot,
+                question
+            ]
+        ).then(
+            fn=finish_answer,
+            inputs=[db_state],
+            outputs=answer_lock_outputs,
+            queue=False
+        )
 
     # 이전 대화 보관 및 초기화
     clear_btn.click(
