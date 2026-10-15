@@ -323,6 +323,7 @@ def answer(question, openai_key, db, history=None):
 # ===== Step 3. 화면 (feature/chat-ui) =====
 
 import os
+import threading
 import gradio as gr
 from pathlib import Path
 from dotenv import load_dotenv
@@ -330,6 +331,13 @@ from dotenv import load_dotenv
 # .env의 OPENAI_API_KEY를 환경변수로 읽어옴 (Spaces에서는 Secrets에 등록)
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# 세션(브라우저 탭)별 현재 DB와 잠금
+# - DB: 재등록·세션 종료 시 이전 Chroma 컬렉션을 삭제하기 위해 기록 (#30)
+# - 잠금: 답변 생성 중에 DB가 삭제·교체되지 않도록 질문과 DB 교체를 순서대로 처리 (#32)
+_session_dbs = {}
+_session_locks = {}
+_sessions_guard = threading.Lock()
 
 
 
@@ -589,43 +597,94 @@ footer {
 # 2. UI 이벤트 함수
 # ==========================================
 
-def select_pdf(file):
-    if file is None:
+def _session_lock(request):
+    with _sessions_guard:
+        return _session_locks.setdefault(request.session_hash, threading.Lock())
+
+
+def _delete_db(db):
+    # 정리에 실패해도 원래 처리 결과를 덮어쓰지 않도록 예외는 기록만 함 (#25)
+    if db is None:
+        return
+    try:
+        db.delete_collection()
+    except Exception as e:
+        print(f"[cleanup] Chroma 컬렉션 삭제 실패: {e}")
+
+
+def select_pdf(files):
+    # 여러 PDF 선택 지원 (#31): 단일 파일이 와도 목록으로 맞춤
+    if not files:
         return None, "파일을 선택해주세요."
 
-    path = file if isinstance(file, str) else file.name
+    if not isinstance(files, list):
+        files = [files]
+    paths = [f if isinstance(f, str) else f.name for f in files]
+    names = ", ".join(Path(p).name for p in paths)
 
-    return path, f"선택한 파일: {Path(path).name}"
+    return paths, f"선택한 파일 ({len(paths)}개): {names}"
 
 
+def start_register(request: gr.Request):
+    # 등록 시작: 이전 DB 참조 해제·컬렉션 삭제 후 질문과 재등록을 막음 (#30, #32)
+    # 잠금을 기다리므로 이미 답변 중인 질문이 끝난 뒤에 DB를 삭제함
+    with _session_lock(request):
+        _delete_db(_session_dbs.pop(request.session_hash, None))
 
-def register_pdf(pdf_path):
-    if not pdf_path:
+    locked = gr.update(interactive=False)
+    return None, "⏳ PDF 처리 중입니다... 완료 후 질문할 수 있습니다.", locked, locked, locked, locked
+
+
+def register_pdf(pdf_paths, request: gr.Request):
+    if not pdf_paths:
         return None, "PDF 파일을 선택해주세요."
 
     if not OPENAI_API_KEY:
         return None, ":warning: OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요."
 
-    return build_db([pdf_path], OPENAI_API_KEY)
+    # 선택한 PDF 전체 목록을 한 번에 넘겨 통합 검색 DB를 만듦 (#31)
+    # 실패하면 None이 반환되고 기존 DB는 복구하지 않음 (#32)
+    db, message = build_db(pdf_paths, OPENAI_API_KEY)
+
+    if db is not None:
+        with _session_lock(request):
+            _session_dbs[request.session_hash] = db
+
+    return db, message
 
 
+def finish_register(db):
+    # 새 DB가 만들어졌을 때만 질문 허용, 업로드는 다시 가능하게 (#32)
+    can_ask = gr.update(interactive=db is not None)
+    return can_ask, can_ask, gr.update(interactive=True), gr.update(interactive=True)
 
-def ask_question(question, db):
+
+def ask_question(question, db, request: gr.Request):
     # answer()가 yield로 답변을 조금씩 내보내므로 그대로 화면에 전달
     if not question or not question.strip():
         yield ":warning: 질문을 입력해주세요."
         return
 
-    if db is None:
-        yield "먼저 PDF 파일을 등록해주세요."
-        return
+    with _session_lock(request):
+        # 처리 중이거나 이미 교체된 DB로는 답하지 않음 (#32)
+        if db is None or db is not _session_dbs.get(request.session_hash):
+            yield "먼저 PDF 파일을 등록해주세요."
+            return
 
-    try:
-        yield from answer(question, OPENAI_API_KEY, db)
-    except gr.Error:
-        raise
-    except Exception as e:
-        yield f":warning: 답변 처리 오류: {e}"
+        try:
+            yield from answer(question, OPENAI_API_KEY, db)
+        except gr.Error:
+            raise
+        except Exception as e:
+            yield f":warning: 답변 처리 오류: {e}"
+
+
+def cleanup_session(request: gr.Request):
+    # 브라우저 탭을 닫으면 그 세션의 컬렉션을 정리 (#30)
+    with _session_lock(request):
+        _delete_db(_session_dbs.pop(request.session_hash, None))
+    with _sessions_guard:
+        _session_locks.pop(request.session_hash, None)
 
 
 
@@ -670,7 +729,8 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             pdf_file = gr.UploadButton(
                 ":paperclip: PDF 파일 선택",
                 file_types=[".pdf"],
-                file_count="single",
+                file_count="multiple",
+                type="filepath",
                 variant="secondary",
                 scale=5,
                 min_width=160,
@@ -701,12 +761,14 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             container=False,
             lines=3,
             max_lines=5,
+            interactive=False,
             elem_id="question-box"
         )
 
         ask_btn = gr.Button(
             "질문하기 →",
             variant="primary",
+            interactive=False,
             elem_id="ask-btn"
         )
 
@@ -730,10 +792,18 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
         outputs=[selected_file, status]
     )
 
+    # 등록: 시작(이전 DB 정리·입력 잠금) → DB 생성 → 결과에 따라 질문 허용
     upload_btn.click(
+        fn=start_register,
+        outputs=[db_state, status, question, ask_btn, pdf_file, upload_btn]
+    ).then(
         fn=register_pdf,
         inputs=[selected_file],
         outputs=[db_state, status]
+    ).then(
+        fn=finish_register,
+        inputs=[db_state],
+        outputs=[question, ask_btn, pdf_file, upload_btn]
     )
 
     ask_btn.click(
@@ -747,6 +817,8 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
         inputs=[question, db_state],
         outputs=output
     )
+
+    demo.unload(cleanup_session)
 
 
 
