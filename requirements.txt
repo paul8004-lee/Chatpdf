@@ -1,4 +1,4 @@
-gradio
+gradio==6.30.0
 langchain
 langchain-community
 langchain-openai
@@ -6,3 +6,4 @@ langchain-text-splitters
 chromadb
 pypdf
 python-dotenv
+langchain-chroma
