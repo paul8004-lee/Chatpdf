@@ -284,3 +284,442 @@ def answer(question, openai_key, db, history=None):
         raise gr.Error("OpenAI 서버에 연결할 수 없습니다. 네트워크를 확인하세요.")
 
 # ===== Step 3. 화면 (feature/chat-ui) =====
+# ===== Step 3. 화면 (feature/chat-ui) =====
+
+import os
+import gradio as gr
+from pathlib import Path
+from dotenv import load_dotenv
+
+# .env의 OPENAI_API_KEY를 환경변수로 읽어옴 (Spaces에서는 Secrets에 등록)
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+
+
+# ==========================================
+# 1. CSS 디자인 + 다크모드
+# ==========================================
+
+CSS = """
+.gradio-container {
+    --page: #FFFFFF;
+    --card: #FFFFFF;
+    --field: #FFFFFF;
+    --answer: #F7F9FF;
+    --fg: #202638;
+    --muted: #738096;
+    --line: #E3E8F1;
+
+    background: var(--page) !important;
+    color: var(--fg) !important;
+    max-width: 720px !important;
+    margin: 0 auto !important;
+    padding: 30px 18px !important;
+    min-height: 100vh;
+    font-family: 'Pretendard', Arial, sans-serif !important;
+}
+
+/* 기본 배경 */
+
+html, body {
+    background: #FFFFFF !important;
+}
+
+/* 다크모드 */
+
+html:has(#mode-select input[type="checkbox"]:checked),
+body:has(#mode-select input[type="checkbox"]:checked) {
+    background: #11141C !important;
+}
+
+.gradio-container:has(
+    #mode-select input[type="checkbox"]:checked
+) {
+    --page: #11141C;
+    --card: #1A1E2B;
+    --field: #252B3A;
+    --answer: #252B3A;
+    --fg: #F3F5FA;
+    --muted: #ACB5C8;
+    --line: #394256;
+
+    color-scheme: dark;
+}
+
+footer {
+    display: none !important;
+}
+
+/* 메인 카드 */
+
+#main-card {
+    background: var(--card) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 20px !important;
+    padding: 24px !important;
+    box-shadow: 0 10px 30px rgba(40,60,100,.05);
+    gap: 14px !important;
+}
+
+/* 제목 */
+
+#title-row {
+    align-items: center !important;
+}
+
+.page-title {
+    font-size: 21px;
+    font-weight: 800;
+    color: var(--fg);
+    margin: 0;
+    line-height: 1.4;
+}
+
+/* 다크모드 체크박스 */
+
+#mode-select {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    min-width: 0 !important;
+}
+
+#mode-select label,
+#mode-select span {
+    color: var(--fg) !important;
+    font-size: 13px !important;
+}
+
+/* 그라데이션 구분선 */
+
+.gradient-line {
+    width: 100%;
+    height: 3px;
+    border-radius: 99px;
+    background: linear-gradient(
+        90deg,
+        #329AFF,
+        #8578FF,
+        #FF65AF
+    );
+    margin: 3px 0 9px;
+}
+
+/* 영역 제목 */
+
+.section-label {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--fg);
+    margin: 0 0 5px;
+}
+
+/* PDF 파일 업로드 */
+
+#file-row {
+    align-items: stretch !important;
+    gap: 10px !important;
+}
+
+#pdf-select {
+    border-radius: 11px !important;
+    background: var(--field) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    min-height: 45px !important;
+    box-shadow: none !important;
+}
+
+#pdf-select,
+#pdf-select * {
+    color: var(--fg) !important;
+}
+
+#upload-btn {
+    background: var(--answer) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 11px !important;
+    min-height: 45px !important;
+}
+
+/* 업로드 상태 */
+
+#upload-status,
+#upload-status * {
+    color: var(--muted) !important;
+    font-size: 12px !important;
+}
+
+/* 질문 입력창 */
+
+#question-box {
+    background: var(--field) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+    overflow: hidden !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+
+#question-box textarea {
+    display: block !important;
+    background: transparent !important;
+    color: var(--fg) !important;
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
+    border-radius: 12px !important;
+    padding: 14px !important;
+    font-size: 14px !important;
+    line-height: 1.6 !important;
+    min-height: 100px !important;
+}
+
+#question-box textarea::placeholder {
+    color: var(--muted) !important;
+}
+
+#question-box:focus-within {
+    border-color: #827AFF !important;
+}
+
+/* 질문하기 버튼 */
+
+#ask-btn {
+    background: linear-gradient(
+        110deg,
+        #329AFF 0%,
+        #827AFF 50%,
+        #FF65AF 100%
+    ) !important;
+    border: none !important;
+    color: #FFFFFF !important;
+    border-radius: 12px !important;
+    min-height: 47px !important;
+    font-size: 14px !important;
+    font-weight: 750 !important;
+    box-shadow: 0 5px 14px rgba(130,122,255,.15);
+}
+
+#ask-btn:hover {
+    filter: brightness(1.06);
+}
+
+/* 답변 영역 */
+
+#answer-box {
+    background: var(--answer) !important;
+    border: 1px solid var(--line) !important;
+    border-left: 4px solid #827AFF !important;
+    border-radius: 12px !important;
+    padding: 16px !important;
+    min-height: 90px;
+    box-shadow: none !important;
+}
+
+#answer-box,
+#answer-box * {
+    color: var(--fg) !important;
+}
+
+/* 모바일 대응 */
+
+@media (max-width: 600px) {
+    .gradio-container {
+        padding: 12px 8px !important;
+    }
+
+    #main-card {
+        padding: 16px !important;
+        border-radius: 16px !important;
+    }
+
+    .page-title {
+        font-size: 18px;
+    }
+
+    #file-row {
+        flex-wrap: nowrap !important;
+    }
+}
+"""
+
+
+
+# ==========================================
+# 2. UI 이벤트 함수
+# ==========================================
+
+def select_pdf(file):
+    if file is None:
+        return None, "파일을 선택해주세요."
+
+    path = file if isinstance(file, str) else file.name
+
+    return path, f"선택한 파일: {Path(path).name}"
+
+
+
+def register_pdf(pdf_path):
+    if not pdf_path:
+        return None, "PDF 파일을 선택해주세요."
+
+    if not OPENAI_API_KEY:
+        return None, ":warning: OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요."
+
+    return build_db([pdf_path], OPENAI_API_KEY)
+
+
+
+def ask_question(question, db):
+    # answer()가 yield로 답변을 조금씩 내보내므로 그대로 화면에 전달
+    if not question or not question.strip():
+        yield ":warning: 질문을 입력해주세요."
+        return
+
+    if db is None:
+        yield "먼저 PDF 파일을 등록해주세요."
+        return
+
+    try:
+        yield from answer(question, OPENAI_API_KEY, db)
+    except gr.Error:
+        raise
+    except Exception as e:
+        yield f":warning: 답변 처리 오류: {e}"
+
+
+
+# ==========================================
+# 3. Gradio Blocks UI
+# ==========================================
+
+with gr.Blocks(title="문서 질의응답 서비스") as demo:
+
+    db_state = gr.State(value=None)
+    selected_file = gr.State(value=None)
+
+    with gr.Column(elem_id="main-card"):
+
+        # 제목 + 다크모드
+        with gr.Row(elem_id="title-row"):
+
+            with gr.Column(scale=5, min_width=180):
+                gr.HTML("""
+                <div class="page-title">
+                    문서 질의응답 서비스
+                </div>
+                """)
+
+            with gr.Column(scale=1, min_width=110):
+                dark_mode = gr.Checkbox(
+                    label=":crescent_moon: 다크모드",
+                    value=False,
+                    container=False,
+                    elem_id="mode-select"
+                )
+
+        gr.HTML('<div class="gradient-line"></div>')
+
+        # PDF 업로드
+        gr.HTML(
+            '<div class="section-label">:page_facing_up: PDF 파일</div>'
+        )
+
+        with gr.Row(elem_id="file-row"):
+
+            pdf_file = gr.UploadButton(
+                ":paperclip: PDF 파일 선택",
+                file_types=[".pdf"],
+                file_count="single",
+                variant="secondary",
+                scale=5,
+                min_width=160,
+                elem_id="pdf-select"
+            )
+
+            upload_btn = gr.Button(
+                "파일 등록",
+                variant="secondary",
+                scale=2,
+                min_width=95,
+                elem_id="upload-btn"
+            )
+
+        status = gr.Markdown(
+            "파일을 선택해주세요.",
+            elem_id="upload-status"
+        )
+
+        # 질문
+        gr.HTML(
+            '<div class="section-label">:speech_balloon: 질문</div>'
+        )
+
+        question = gr.Textbox(
+            placeholder="문서에 대해 궁금한 내용을 입력하세요...",
+            show_label=False,
+            container=False,
+            lines=3,
+            max_lines=5,
+            elem_id="question-box"
+        )
+
+        ask_btn = gr.Button(
+            "질문하기 →",
+            variant="primary",
+            elem_id="ask-btn"
+        )
+
+        # 답변
+        gr.HTML(
+            '<div class="section-label">:sparkles: 답변</div>'
+        )
+
+        output = gr.Markdown(
+            "질문을 입력하면 이곳에 답변이 표시됩니다.",
+            elem_id="answer-box"
+        )
+
+    # ======================================
+    # 4. 이벤트 핸들러
+    # ======================================
+
+    pdf_file.upload(
+        fn=select_pdf,
+        inputs=[pdf_file],
+        outputs=[selected_file, status]
+    )
+
+    upload_btn.click(
+        fn=register_pdf,
+        inputs=[selected_file],
+        outputs=[db_state, status]
+    )
+
+    ask_btn.click(
+        fn=ask_question,
+        inputs=[question, db_state],
+        outputs=output
+    )
+
+    question.submit(
+        fn=ask_question,
+        inputs=[question, db_state],
+        outputs=output
+    )
+
+
+
+# ==========================================
+# 5. 서버 실행
+# ==========================================
+
+if __name__ == "__main__":
+    demo.launch(
+        css=CSS,
+        theme=gr.themes.Soft()
+    )
