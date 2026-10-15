@@ -5,8 +5,6 @@ langchain-community<0.4
 langchain-openai<1.0
 langchain-text-splitters<1.0
 langchain-chroma<1.0
-langchainhub
-langgraph<1.0
 chromadb
 pypdf
 pymupdf>=1.26,<2
