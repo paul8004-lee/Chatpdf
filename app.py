@@ -1,3 +1,21 @@
+
+
+
+# ===== Step 0. 공통 import (Step 2 answer 함수에서 사용) =====
+import gradio as gr
+from langchain_openai import ChatOpenAI
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+# langchain 버전에 따라 위치가 달라서 둘 다 시도
+try:
+    from langchain.retrievers.multi_query import MultiQueryRetriever
+    from langchain import hub
+except Exception:  # 새 버전/파이썬 3.14에서는 ImportError 외 오류도 나서 전체를 잡음
+    from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+    from langchain_classic import hub
+
+
 # ===== Step 1. PDF 처리 (feature/pdf-processing) =====
 
 
@@ -32,11 +50,8 @@ def answer(question, openai_key, db):
 
 # ===== Step 3. 화면 (feature/chat-ui) =====
 
-
-# ===== Step 3. 화면 (feature/chat-ui) =====
-
-import gradio as gr
-from pathlib import Path
+import gradio as gr  # [삭제 대상] Step 0에 이미 있음 (중복)
+from pathlib import Path  # [유지] select_pdf 등에서 사용
 
 
 # ==========================================
@@ -44,9 +59,11 @@ from pathlib import Path
 # 실제 Step 1, Step 2 완성 후 삭제
 # ==========================================
 
-def build_db(pdf_path):
+# [삭제 대상] 이 구역(1. 테스트용 함수) 전체: build_db, answer 두 함수 모두
+# Step 1 담당자의 build_db(pdf_path)와 Step 2 담당자의 answer로 대체됨
+def build_db(pdf_path):  # [삭제 대상] Step 1 담당자의 build_db로 대체
     if not pdf_path:
-        return None, "PDF 파일을 선택해주세요."
+        return None, "PDF 파일을 선택해주세요."  # 올릴때는 지우고 (build_db, answer 둘 다)
 
     filename = Path(pdf_path).name
 
@@ -56,7 +73,7 @@ def build_db(pdf_path):
     )
 
 
-def answer(question, db):
+def answer(question, db):  # [삭제 대상] Step 2의 answer로 대체
     if db is None:
         return "먼저 PDF 파일을 등록해주세요."
 
@@ -277,21 +294,44 @@ footer {
     filter: brightness(1.06);
 }
 
-/* 답변 영역 */
+/* 대화 영역 (Chatbot) */
 
-#answer-box {
+#chat-box {
     background: var(--answer) !important;
     border: 1px solid var(--line) !important;
     border-left: 4px solid #827aff !important;
     border-radius: 12px !important;
-    padding: 16px !important;
-    min-height: 90px;
     box-shadow: none !important;
 }
 
-#answer-box,
-#answer-box * {
+#chat-box,
+#chat-box * {
     color: var(--fg) !important;
+}
+
+/* 말풍선: 사용자는 입력창 색, 답변은 카드 색 */
+
+#chat-box .message {
+    border: 1px solid var(--line) !important;
+}
+
+#chat-box .message.user {
+    background: var(--field) !important;
+}
+
+#chat-box .message.bot {
+    background: var(--card) !important;
+}
+
+/* 대화 초기화 버튼 */
+
+#clear-btn {
+    background: var(--answer) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+    min-height: 40px !important;
+    box-shadow: none !important;
 }
 
 /* 모바일 */
@@ -323,7 +363,7 @@ footer {
 
 def select_pdf(file):
     if file is None:
-        return None, "파일을 선택해주세요."
+        return None, "대상 파일을 선택해주세요."
 
     path = file if isinstance(file, str) else file.name
 
@@ -334,21 +374,52 @@ def register_pdf(pdf_path):
     return build_db(pdf_path)
 
 
-def ask_question(question, db):
+def ask_question(question, history, db): # 리스트 안에 이전 대화 기록 적재
+    history = list(history or [])
+
+    # 빈 질문: 챗봇 안에 안내 메시지만 추가
     if not question or not question.strip():
-        return "⚠️ 질문을 입력해주세요."
+        history.append({"role": "assistant", "content": "⚠️질문을 입력해주세요."})
+        yield history, ""
+        return
+
+    # 질문을 먼저 말풍선으로 보여주고 입력창은 비움
+    history.append({"role": "user", "content": question})
+
+    # PDF 미등록: 안내 메시지 표시 (answer가 안내해 주지만 여기서도 미리 막음)
+    if db is None:
+        history.append({"role": "assistant", "content": "⚠️ PDF를 선택한 뒤 '파일 등록' 버튼을 눌러주세요."})
+        yield history, ""
+        return
+
+    history.append({"role": "assistant", "content": "답변을 생성하는 중..."})
+    yield history, ""
 
     try:
-        return str(answer(question, db))
+        result = answer(question, db)
+
+        # answer가 문자열이면 한 번에, yield(스트리밍)이면 조각마다 갱신
+        if isinstance(result, str):
+            history[-1]["content"] = result
+            yield history, ""
+        else:
+            for text in result:
+                history[-1]["content"] = str(text)
+                yield history, ""
     except Exception as e:
-        return f"⚠️ 답변 처리 오류: {e}"
+        history[-1]["content"] = f"⚠️ 답변 처리 오류: {e}"
+        yield history, ""
+
+
+def clear_chat():
+    return []
 
 
 # ==========================================
 # 4. Gradio Blocks UI
 # ==========================================
 
-with gr.Blocks(title="문서 질의응답 서비스") as demo:
+with gr.Blocks(title="[현답] 문서 질의응답 서비스") as demo:
 
     db_state = gr.State(value=None)
     selected_file = gr.State(value=None)
@@ -361,7 +432,7 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             with gr.Column(scale=5, min_width=180):
                 gr.HTML("""
                 <div class="page-title">
-                    문서 질의응답 서비스
+                    [현답] 문서 질의응답 서비스
                 </div>
                 """)
 
@@ -411,10 +482,10 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
         )
 
         question = gr.Textbox(
-            placeholder="문서에 대해 궁금한 내용을 입력하세요...",
+            placeholder="문서에 대해 궁금한 내용을 입력하세요. 줄바꿈은 (Shift+Enter를 활용하세요.)",
             show_label=False,
             container=False,
-            lines=3,
+            lines=1,  # lines=1이어야 Enter로 제출됨 (줄바꿈은 Shift+Enter)
             max_lines=5,
             elem_id="question-box"
         )
@@ -425,14 +496,23 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             elem_id="ask-btn"
         )
 
-        # 답변
+        # 대화 기록
         gr.HTML(
-            '<div class="section-label">✨ 답변</div>'
+            '<div class="section-label">✨ 채팅 기록</div>'
         )
 
-        output = gr.Markdown(
-            "질문을 입력하면 이곳에 답변이 표시됩니다.",
-            elem_id="answer-box"
+        chatbot = gr.Chatbot(
+            placeholder="질문을 입력하면 이곳에 채팅 기록이 쌓입니다.",
+            show_label=False,
+            layout="bubble",
+            height=400,
+            elem_id="chat-box"
+        )
+
+        clear_btn = gr.Button(
+            "채팅 초기화",
+            variant="secondary",
+            elem_id="clear-btn"
         )
 
     # ======================================
@@ -453,19 +533,24 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
     ask_btn.click(
         fn=ask_question,
-        inputs=[question, db_state],
-        outputs=output
+        inputs=[question, chatbot, db_state],
+        outputs=[chatbot, question]
     )
 
     question.submit(
         fn=ask_question,
-        inputs=[question, db_state],
-        outputs=output
+        inputs=[question, chatbot, db_state],
+        outputs=[chatbot, question]
+    )
+
+    clear_btn.click(
+        fn=clear_chat,
+        outputs=chatbot
     )
 
 
 # ==========================================
-# 6. 실행 (Gradio 6.x)
+# 6. 실행
 # ==========================================
 
 if __name__ == "__main__":
