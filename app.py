@@ -7,6 +7,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
+import request_log
 
 NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
 
@@ -19,6 +20,17 @@ def _load_failure_reason(error):
 
 
 def build_db(pdf_paths, openai_key):
+    """Process PDF paths and append request diagnostics without storing credentials."""
+    with request_log.request(LOG_PATH, "pdf_processing", secrets=(openai_key,)) as trace:
+        db, message = _build_db(pdf_paths, openai_key)
+        if db is None:
+            trace.status = "error" if pdf_paths else "empty"
+        trace.emit("pdf_result", status=trace.status, message=message,
+                   collection=getattr(db, "_collection_name", None) if db is not None else None)
+        return db, message
+
+
+def _build_db(pdf_paths, openai_key):
     """단일 경로 또는 경로 목록을 받아 (새 DB, 처리 메시지)를 반환한다.
 
     파일별로 읽기·분할하고, 실패한 파일은 제외한 채 성공한 파일만으로 DB를 만든다 (#42).
@@ -28,6 +40,7 @@ def build_db(pdf_paths, openai_key):
     if not pdf_paths:
         return None, ""
     if not openai_key or not openai_key.strip():
+        request_log.current().emit("validation_failed", reason="missing_api_key")
         return None, "⚠️ OpenAI API 키를 입력한 뒤 PDF를 다시 올려주세요."
     if isinstance(pdf_paths, (str, Path)):
         pdf_paths = [pdf_paths]
@@ -41,14 +54,20 @@ def build_db(pdf_paths, openai_key):
     for pdf_path in pdf_paths:
         filename = Path(pdf_path).name
         try:
-            pages = PyPDFLoader(str(pdf_path)).load()
-            for page in pages:
-                page.metadata["source_filename"] = filename
-            chunks = splitter.split_documents(pages)
-            if not chunks:
-                raise ValueError(NO_TEXT_ERROR)
+            with request_log.stage("pdf_load_split"):
+                pages = PyPDFLoader(str(pdf_path)).load()
+                for page in pages:
+                    page.metadata["source_filename"] = filename
+                chunks = splitter.split_documents(pages)
+                if not chunks:
+                    raise ValueError(NO_TEXT_ERROR)
+                for chunk in chunks:
+                    chunk.metadata["chunk_id"] = uuid.uuid4().hex
+                request_log.current().emit("pdf_loaded", filename=filename,
+                                           pages=len(pages), chunks=len(chunks))
         except Exception as error:
-            logging.getLogger(__name__).warning("PDF 처리 제외: %s (%s)", filename, error)
+            request_log.current().emit("pdf_excluded", filename=filename,
+                                       reason=_load_failure_reason(error))
             failures.append((filename, _load_failure_reason(error)))
             continue
         documents.append((filename, chunks))
@@ -61,16 +80,22 @@ def build_db(pdf_paths, openai_key):
     # 임베딩·저장 실패는 API 키·연결 문제라 전체 실패로 처리
     db = None
     try:
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=openai_key)
-        db = Chroma(collection_name=f"pdf_{uuid.uuid4().hex}", embedding_function=embeddings)
-        for filename, chunks in documents:
-            db.add_documents(chunks)
+        with request_log.stage("embedding_storage"):
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-large", openai_api_key=openai_key)
+            db = Chroma(collection_name=f"pdf_{uuid.uuid4().hex}", embedding_function=embeddings)
+            for filename, chunks in documents:
+                db.add_documents(chunks, ids=[c.metadata["chunk_id"] for c in chunks])
     except Exception:
         _delete_db(db)
         return None, f"❌ 처리 실패: {filename}. API 키/연결을 확인하세요."
+    finally:
+        # LangChain embeddings do not expose response usage to callbacks.
+        request_log.current().usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
+                                    stage="embedding_storage")
     chunk_count = sum(len(chunks) for _, chunks in documents)
     message = f"✅ 처리 완료: {len(documents)}개 파일 · {page_count}페이지 · {chunk_count}개 청크"
     if failures:
+        request_log.current().status = "partial"
         message += f"\n\n⚠️ 제외된 파일 {len(failures)}개\n{failure_lines}"
     return db, message
 
@@ -82,10 +107,8 @@ def build_db(pdf_paths, openai_key):
 # Step 2에서 쓰는 import는 이 구역에 모아 둡니다. (다른 Step과 merge 충돌 방지)
 
 # ---------- 파이썬 기본 라이브러리 ----------
-import json                      # 성능 기록을 JSON 형식(한 줄짜리 텍스트)으로 저장할 때 사용
 import re                        # 정규표현식: 파일 경로에서 파일 이름만 잘라낼 때 사용
 import time                      # 답변에 걸린 시간(초)을 잴 때 사용
-from datetime import datetime    # 성능 기록에 "언제 질문했는지" 날짜·시간을 남길 때 사용
 from pathlib import Path         # 파일 경로를 운영체제(Windows/Linux)에 상관없이 다루는 도구
 
 # ---------- 외부 패키지 (requirements.txt로 설치됨) ----------
@@ -187,9 +210,12 @@ def _rerank(llm, docs, query):
     if len(docs) <= TOP_K:                                      # 조각이 이미 TOP_K개 이하면 고를 필요가 없으니
         return docs                                             #   그대로 돌려줌 (API 호출 절약)
     try:
-        reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=TOP_K)       # GPT로 순위를 매기는 도구 생성
-        return list(reranker.compress_documents(docs, query)) or docs[:TOP_K]  # 순위가 높은 TOP_K개만 받음 (결과가 비면 앞에서 TOP_K개)
+        with request_log.stage("rerank"):
+            reranker = LLMListwiseRerank.from_llm(llm=llm, top_n=TOP_K)
+            return list(reranker.compress_documents(docs, query)) or docs[:TOP_K]
     except Exception:                                           # 재정렬 중 어떤 오류가 나도
+        if request_log.current():
+            request_log.current().emit("rerank_fallback", status="fallback")
         return docs[:TOP_K]                                     #   답변은 계속되도록 원래 순서의 앞 TOP_K개를 사용
 
 
@@ -218,14 +244,20 @@ def _cache_clear(db):
 
 
 def _log(**record):
-    """[업그레이드 3] 질문 1개마다 걸린 시간 등을 eval/qa_log.jsonl 파일에 한 줄씩 추가 기록."""
-    try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)      # eval 폴더가 없으면 만듦 (있으면 그냥 넘어감)
-        record["time"] = datetime.now().isoformat(timespec="seconds")  # 기록 시각 추가. 예: '2026-10-14T17:30:05'
-        with LOG_PATH.open("a", encoding="utf-8") as f:         # 파일을 '이어쓰기(a)' 모드로 열어서
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")  # 한글이 깨지지 않게 JSON 한 줄로 저장
-    except Exception:                                           # 기록에 실패해도 (권한 문제 등)
-        pass                                                    #   답변에는 영향 없도록 조용히 넘어감
+    """Keep the original QA fields alongside request events."""
+    trace = request_log.current()
+    if trace:
+        trace.emit("qa_result", **record)
+
+
+def _log_documents(db, docs):
+    trace = request_log.current()
+    if trace:
+        trace.emit("retrieval_result", collection=getattr(db, "_collection_name", None),
+                   documents=[dict(filename=_source_name(d.metadata),
+                                   page=_page_label(d.metadata),
+                                   chunk_id=d.metadata.get("chunk_id") or getattr(d, "id", None))
+                              for d in docs])
 
 
 def _history_to_text(history):
@@ -247,6 +279,15 @@ def _history_to_text(history):
 
 
 def answer(question, openai_key, db, history=None):
+    """Stream an answer while logging one request across Gradio worker contexts."""
+    if request_log.current():
+        yield from _answer(question, openai_key, db, history)
+    else:
+        with request_log.request(LOG_PATH, "qa", secrets=(openai_key,), activate=False) as trace:
+            yield from request_log.iterate(trace, _answer(question, openai_key, db, history))
+
+
+def _answer(question, openai_key, db, history=None):
     """질문을 받아 답변을 만드는 메인 함수.
     question  : 사용자가 입력한 질문
     openai_key: 사용자가 입력한 OpenAI API 키
@@ -263,7 +304,10 @@ def answer(question, openai_key, db, history=None):
     if len(question) > MAX_QUESTION_LEN:                        # 질문이 너무 길면
         raise gr.Error(f"질문은 {MAX_QUESTION_LEN}자 이내로 입력하세요.")  # 오류 창 띄우고 멈춤
 
-    llm = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=openai_key)  # GPT 준비. temperature=0: 같은 질문엔 최대한 같은 답
+    trace = request_log.current()
+    trace.emit("qa_context", collection=getattr(db, "_collection_name", None), model=MODEL_NAME)
+    llm = ChatOpenAI(model=MODEL_NAME, temperature=0, api_key=openai_key,
+                     stream_usage=True, callbacks=[request_log.TokenUsageCallback(trace, MODEL_NAME)])
     start = time.perf_counter()                                 # [업그레이드 3] 시간 측정 시작 (스톱워치 누르기)
 
     try:                                                        # 아래에서 OpenAI 오류가 나면 맨 아래 except에서 처리
@@ -271,13 +315,15 @@ def answer(question, openai_key, db, history=None):
         history_text = _history_to_text(history)                # 대화 기록을 글로 변환
         search_question = question                              # 기본값: 사용자가 쓴 질문 그대로 검색
         if history_text:                                        # 이전 대화가 있으면
-            search_question = (CONDENSE_PROMPT | llm | StrOutputParser()).invoke(  # 프롬프트 → GPT → 글자만 꺼내기 순서로 실행
-                {"history": history_text, "question": question}  # 프롬프트의 {history}, {question} 자리에 넣을 값
-            ).strip() or question                               # 결과 앞뒤 공백 제거. 결과가 비면 원래 질문 사용
+            with request_log.stage("question_rewrite"):
+                search_question = (CONDENSE_PROMPT | llm | StrOutputParser()).invoke(
+                    {"history": history_text, "question": question}
+                ).strip() or question
 
         # ===== 3단계: [업그레이드 2] 캐시 확인 =====
         cached = _cache_get(db, search_question)                # 같은 질문에 대한 저장된 답변이 있는지 확인
         if cached:                                              # 있으면
+            trace.status = "cached"
             _log(question=question, search_question=search_question, cached=True,  # 캐시로 답했다고 기록
                  seconds=round(time.perf_counter() - start, 2))  # 걸린 시간(초, 소수점 둘째 자리까지)
             yield cached                                        # 저장된 답변을 바로 화면에 보여주고
@@ -294,21 +340,31 @@ def answer(question, openai_key, db, history=None):
             prompt=MULTI_QUERY_PROMPT,                          # 한국어 질문을 만들도록 직접 만든 프롬프트 사용
             include_original=True,                              # 바꾼 질문 3개 + 원래 질문까지 총 4번 검색
         )
-        docs = retriever.invoke(search_question)[: TOP_K * 2]   # 검색 실행. 중복 제거된 결과 중 앞 8개만 사용
+        try:
+            with request_log.stage("retrieval"):
+                docs = retriever.invoke(search_question)[: TOP_K * 2]
+                _log_documents(db, docs)
+        finally:
+            trace.usage("text-embedding-3-large", reason="embedding_adapter_usage_unavailable",
+                        stage="retrieval_embeddings")
         docs = _rerank(llm, docs, search_question)              # [업그레이드 1] 8개 중 가장 관련 있는 4개로 추림
+        with request_log.stage("selected_context"):
+            _log_documents(db, docs)
 
         if not docs:                                            # 관련 내용을 하나도 못 찾았으면
+            trace.status = "no_results"
             yield "업로드한 문서에서 관련 내용을 찾지 못했습니다. 질문을 바꿔서 다시 시도해 보세요."  # 안내 문구 표시
             return                                              # 함수 끝
 
         # ===== 5단계: GPT로 답변 만들기 (조금씩 화면에 표시) =====
         chain = ANSWER_PROMPT | llm | StrOutputParser()         # 프롬프트 → GPT → 글자만 꺼내기를 하나로 연결
         text = ""                                               # 지금까지 받은 답변을 모아 둘 변수
-        for chunk in chain.stream(                              # stream: 답변을 한 번에 받지 않고 조각조각 받음
-            {"context": _format_docs(docs), "question": search_question}  # {context}=검색된 PDF 내용, {question}=질문
-        ):
-            text += chunk                                       # 새로 받은 조각을 이어 붙이고
-            yield text                                          # 지금까지의 답변을 화면에 갱신 (타자 치는 효과)
+        with request_log.stage("answer_generation"):
+            for chunk in chain.stream(
+                {"context": _format_docs(docs), "question": search_question}
+            ):
+                text += chunk
+                yield text
 
         # ===== 6단계: 참고 페이지 붙이기 =====
         final = text + _format_sources(docs)                    # 완성된 답변 아래에 '참고: report.pdf (p.2, 5)' 추가
@@ -321,11 +377,14 @@ def answer(question, openai_key, db, history=None):
              pages=[_page_label(d.metadata) for d in docs])     # 답변 근거로 쓴 페이지 목록
 
     # ===== 오류 처리: OpenAI 오류를 사용자가 이해할 수 있는 한국어로 안내 =====
-    except openai.AuthenticationError:                          # API 키가 틀렸거나 만료된 경우
+    except openai.AuthenticationError as error:                          # API 키가 틀렸거나 만료된 경우
+        trace.error(error)
         raise gr.Error("API 키가 올바르지 않습니다. 키를 다시 확인하세요.")
-    except openai.RateLimitError:                               # 너무 자주 요청했거나 크레딧(사용 한도)을 다 쓴 경우
+    except openai.RateLimitError as error:                               # 너무 자주 요청했거나 크레딧(사용 한도)을 다 쓴 경우
+        trace.error(error)
         raise gr.Error("OpenAI 사용 한도를 초과했습니다. 잠시 후 다시 시도하세요.")
-    except openai.APIConnectionError:                           # 인터넷 연결 문제 등으로 OpenAI 서버에 접속 못 한 경우
+    except openai.APIConnectionError as error:                           # 인터넷 연결 문제 등으로 OpenAI 서버에 접속 못 한 경우
+        trace.error(error)
         raise gr.Error("OpenAI 서버에 연결할 수 없습니다. 네트워크를 확인하세요.")
 
 
@@ -644,8 +703,15 @@ def _delete_db(db):
 
     try:
         db.delete_collection()
-    except Exception:
-        logging.getLogger(__name__).exception("Chroma 컬렉션 삭제 실패")
+    except Exception as error:
+        trace = request_log.current()
+        if trace:
+            trace.error(error, cleanup=True)
+        else:
+            with request_log.request(LOG_PATH, "db_cleanup", secrets=(OPENAI_API_KEY,)) as trace:
+                trace.status = "error"
+                trace.error(error)
+        logging.getLogger(__name__).error("Chroma 컬렉션 삭제 실패: %s", trace.redact(str(error)))
 
 
 # ==========================================
@@ -716,9 +782,14 @@ def start_register(request: gr.Request):
 def register_pdf(pdf_paths, request: gr.Request):
 
     if not pdf_paths:
+        with request_log.request(LOG_PATH, "pdf_registration", secrets=(OPENAI_API_KEY,)) as trace:
+            trace.status = "empty"
         return None, "⚠️ PDF 파일을 선택해주세요."
 
     if not OPENAI_API_KEY:
+        with request_log.request(LOG_PATH, "pdf_registration") as trace:
+            trace.status = "error"
+            trace.emit("validation_failed", reason="missing_api_key")
         return (
             None,
             "⚠️ OPENAI_API_KEY가 없습니다. .env 파일을 확인해주세요."
@@ -752,11 +823,18 @@ def finish_register(db):
 # ==========================================
 
 def ask_question(question, history, db, request: gr.Request):
+    with request_log.request(LOG_PATH, "qa", secrets=(OPENAI_API_KEY,), activate=False) as trace:
+        yield from request_log.iterate(trace, _ask_question(question, history, db, request))
+
+
+def _ask_question(question, history, db, request):
 
     history = list(history or [])
     prior_history = list(history)
 
     if not question or not question.strip():
+        request_log.current().status = "error"
+        request_log.current().emit("validation_failed", reason="empty_question")
         history.append({
             "role": "assistant",
             "content": "⚠️ 질문을 입력해주세요."
@@ -772,6 +850,8 @@ def ask_question(question, history, db, request: gr.Request):
     with _session_lock(request):
 
         if db is None or db is not _session_dbs.get(request.session_hash):
+            request_log.current().status = "error"
+            request_log.current().emit("validation_failed", reason="missing_or_replaced_db")
             history.append({
                 "role": "assistant",
                 "content": "⚠️ PDF를 선택한 뒤 파일 등록 버튼을 눌러주세요."
@@ -803,6 +883,8 @@ def ask_question(question, history, db, request: gr.Request):
                     yield history, ""
 
         except Exception as e:
+            request_log.current().status = "error"
+            request_log.current().error(e)
             history[-1]["content"] = f"⚠️ 답변 처리 오류: {e}"
             yield history, ""
 

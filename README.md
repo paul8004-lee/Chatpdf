@@ -76,3 +76,17 @@ python app.py
 4. 검색 결과의 `source_filename`과 `page + 1`을 화면에 표시합니다.
 
 검증: `python -m unittest test_app -v`. 실제 PDF와 Chroma를 사용하고, 임베딩만 로컬 대체값을 사용합니다. 다중 PDF 검색·메타데이터·단일 PDF·새 컬렉션 격리·손상된 PDF·텍스트 없는 PDF·임베딩 실패를 검증합니다. 실제 OpenAI API 및 화면 연동 검증은 별도입니다.
+
+## 요청별 누적 로그 (#49)
+
+`eval/qa_log.jsonl`에 JSON 한 줄씩 추가합니다. 기존 로그는 유지되며 새 기록에는 `schema_version=1`, UTC `time`, `request_id`, `operation`, `stage`, `event`가 포함됩니다. 파일은 Git에서 제외합니다.
+
+- PDF 읽기·분할, 임베딩·저장, 질문 재작성, 검색, 재정렬, 답변 생성의 단계 결과와 소요 시간을 기록합니다. 오류는 종류·메시지·traceback을 남기며, 재정렬 대체 처리와 일부 PDF 제외도 구분합니다.
+- `request_finished.status`는 `success`, `partial`(일부 PDF 제외), `cached`, `no_results`, `empty`, `error`, `cancelled`로 요청 결과를 구분합니다. 같은 `request_id`로 단계 기록을 모으고, 서로 다른 PDF 등록·질문 요청은 `collection`으로 연결할 수 있습니다.
+- `token_usage` 이벤트에 모델명과 제공자가 반환한 입력·출력·총 토큰을 기록합니다. 스트리밍도 사용량을 요청하며, 요청 종료 기록의 `token_usage`는 수집된 값의 합계입니다. 캐시 요청도 질문 재작성을 호출했다면 그 사용량이 포함됩니다.
+- LangChain 임베딩 어댑터는 실제 사용량을 노출하지 않으므로 임베딩·검색 임베딩은 `usage_status=unavailable`, 토큰은 `null`, 원인은 `embedding_adapter_usage_unavailable`로 기록합니다. 실패한 모델 호출 등 사용량이 누락되면 합계의 `usage_status=partial`이며 **실제 전체 사용량이나 과금액으로 해석하면 안 됩니다**. 토큰을 추정하지 않습니다.
+- 검색 후보와 최종 문맥에는 원본 파일명, 실제 PDF 페이지, 컬렉션 이름, 청크 ID를 기록합니다. 새 청크 ID는 Chroma 문서 ID와 동일합니다. API 키·Bearer 값·민감한 키 이름의 값은 가리고, 프롬프트·답변·문서 본문 전체는 저장하지 않습니다. 기존 QA 결과의 질문·검색 질문은 기록하므로 로그 파일 접근 권한과 공유 범위는 별도로 관리해야 합니다.
+
+로그 쓰기 실패는 요청 ID와 예외 종류를 콘솔에 알리며 앱 동작을 중단하지 않습니다. 현재 단일 프로세스 내 쓰기를 잠금으로 보호합니다. 로그는 자동 삭제·회전하지 않으므로 보관·백업은 운영 환경에서 관리합니다.
+
+오프라인 검증: `python -m unittest discover -v` (외부 API 호출 없음). 기존 PDF 테스트와 함께 정상·캐시·검색 결과 없음·오류·토큰 수집/누락·메타데이터·비밀값 가림·쓰기 실패·스트리밍 컨텍스트 전환을 확인합니다.
