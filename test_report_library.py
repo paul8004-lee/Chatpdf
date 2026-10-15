@@ -179,6 +179,15 @@ class ReportLibraryTest(unittest.TestCase):
         self.assertEqual(coverage["missing"], [])
         self.assertEqual(set(coverage["covered"]), {"solar.pdf", "freight.pdf"})
 
+    def test_all_search_modes_preserve_catalog_selection(self):
+        db = self.make_db()
+        biased = Mock(invoke=Mock(return_value=db.similarity_search("apple", k=1)))
+        with patch.object(app.MultiQueryRetriever, "from_llm", return_value=biased), \
+             patch.object(app, "_rerank_checked", side_effect=lambda llm, docs, query, top_n: (docs, True)):
+            for mode in app.SEARCH_MODES:
+                docs, _ = app._retrieve(db, self.fake_llm(), "태양광과 물류를 비교해줘", mode=mode, k=2)
+                self.assertEqual({d.metadata["source_filename"] for d in docs}, {"solar.pdf", "freight.pdf"}, mode)
+
     def test_missing_report_evidence_is_explicit(self):
         db = self.make_db()
         first = db.similarity_search("apple", k=1)
