@@ -284,7 +284,6 @@ def answer(question, openai_key, db, history=None):
         raise gr.Error("OpenAI 서버에 연결할 수 없습니다. 네트워크를 확인하세요.")
 
 # ===== Step 3. 화면 (feature/chat-ui) =====
-# ===== Step 3. 화면 (feature/chat-ui) =====
 
 import os
 import threading
@@ -516,21 +515,44 @@ footer {
     filter: brightness(1.06);
 }
 
-/* 답변 영역 */
+/* 대화 영역 (Chatbot) */
 
-#answer-box {
+#chat-box {
     background: var(--answer) !important;
     border: 1px solid var(--line) !important;
     border-left: 4px solid #827AFF !important;
     border-radius: 12px !important;
-    padding: 16px !important;
-    min-height: 90px;
     box-shadow: none !important;
 }
 
-#answer-box,
-#answer-box * {
+#chat-box,
+#chat-box * {
     color: var(--fg) !important;
+}
+
+/* 말풍선: 사용자는 입력창 색, 답변은 카드 색 */
+
+#chat-box .message {
+    border: 1px solid var(--line) !important;
+}
+
+#chat-box .message.user {
+    background: var(--field) !important;
+}
+
+#chat-box .message.bot {
+    background: var(--card) !important;
+}
+
+/* 대화 초기화 버튼 */
+
+#clear-btn {
+    background: var(--answer) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+    min-height: 40px !important;
+    box-shadow: none !important;
 }
 
 /* 모바일 대응 */
@@ -604,7 +626,7 @@ def register_pdf(pdf_paths, request: gr.Request):
         return None, "PDF 파일을 선택해주세요."
 
     if not OPENAI_API_KEY:
-        return None, ":warning: OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요."
+        return None, "⚠️ OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요."
 
     # 선택한 PDF 전체 목록을 한 번에 넘겨 통합 검색 DB를 만듦 (#31)
     # 실패하면 None이 반환되고 기존 DB는 복구하지 않음 (#32)
@@ -622,25 +644,48 @@ def finish_register(db):
     can_ask = gr.update(interactive=db is not None)
     return can_ask, can_ask, gr.update(interactive=True), gr.update(interactive=True)
 
+def ask_question(question, history, db, request: gr.Request):
+    # history: [{"role": "user" | "assistant", "content": "..."}, ...]
+    history = list(history or [])
+    prior_history = list(history)  # 이번 질문을 넣기 전의 기록 (answer에 맥락으로 전달)
 
-def ask_question(question, db, request: gr.Request):
-    # answer()가 yield로 답변을 조금씩 내보내므로 그대로 화면에 전달
+    # 빈 질문: 챗봇 안에 안내 메시지만 추가
     if not question or not question.strip():
-        yield ":warning: 질문을 입력해주세요."
+        history.append({"role": "assistant", "content": "⚠️ 질문을 입력해주세요."})
+        yield history, ""
         return
 
+    # 질문을 먼저 말풍선으로 보여주고 입력창은 비움
+    history.append({"role": "user", "content": question})
+
     with _session_lock(request):
-        # 처리 중이거나 이미 교체된 DB로는 답하지 않음 (#32)
+        # PDF 미등록, 처리 중, 이미 교체된 DB로는 답하지 않음 (#32)
         if db is None or db is not _session_dbs.get(request.session_hash):
-            yield "먼저 PDF 파일을 등록해주세요."
+            history.append({"role": "assistant", "content": "⚠️ PDF를 선택한 뒤 '파일 등록' 버튼을 눌러주세요."})
+            yield history, ""
             return
 
+        history.append({"role": "assistant", "content": "답변을 생성하는 중..."})
+        yield history, ""
+
         try:
-            yield from answer(question, OPENAI_API_KEY, db)
-        except gr.Error:
-            raise
+            # answer()가 yield로 답변을 조금씩 내보내므로 조각마다 말풍선 갱신
+            # (문자열 하나만 돌려주는 경우도 처리)
+            result = answer(question, OPENAI_API_KEY, db, prior_history)
+            if isinstance(result, str):
+                history[-1]["content"] = result
+                yield history, ""
+            else:
+                for text in result:
+                    history[-1]["content"] = str(text)
+                    yield history, ""
         except Exception as e:
-            yield f":warning: 답변 처리 오류: {e}"
+            history[-1]["content"] = f"⚠️ 답변 처리 오류: {e}"
+            yield history, ""
+
+
+def clear_chat():
+    return []
 
 
 def cleanup_session(request: gr.Request):
@@ -675,7 +720,7 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
             with gr.Column(scale=1, min_width=110):
                 dark_mode = gr.Checkbox(
-                    label=":crescent_moon: 다크모드",
+                    label="🌙 다크모드",
                     value=False,
                     container=False,
                     elem_id="mode-select"
@@ -685,13 +730,13 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
         # PDF 업로드
         gr.HTML(
-            '<div class="section-label">:page_facing_up: PDF 파일</div>'
+            '<div class="section-label">📄 PDF 파일</div>'
         )
 
         with gr.Row(elem_id="file-row"):
 
             pdf_file = gr.UploadButton(
-                ":paperclip: PDF 파일 선택",
+                "📎 PDF 파일 선택",
                 file_types=[".pdf"],
                 file_count="multiple",
                 type="filepath",
@@ -716,14 +761,14 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
         # 질문
         gr.HTML(
-            '<div class="section-label">:speech_balloon: 질문</div>'
+            '<div class="section-label">💬 질문</div>'
         )
 
         question = gr.Textbox(
             placeholder="문서에 대해 궁금한 내용을 입력하세요...",
             show_label=False,
             container=False,
-            lines=3,
+            lines=1,  # lines=1이어야 Enter로 제출됨 (줄바꿈은 Shift+Enter)
             max_lines=5,
             interactive=False,
             elem_id="question-box"
@@ -736,14 +781,23 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             elem_id="ask-btn"
         )
 
-        # 답변
+        # 대화 기록
         gr.HTML(
-            '<div class="section-label">:sparkles: 답변</div>'
+            '<div class="section-label">✨ 대화</div>'
         )
 
-        output = gr.Markdown(
-            "질문을 입력하면 이곳에 답변이 표시됩니다.",
-            elem_id="answer-box"
+        chatbot = gr.Chatbot(
+            placeholder="질문을 입력하면 이곳에 대화가 쌓입니다.",
+            show_label=False,
+            layout="bubble",
+            height=400,
+            elem_id="chat-box"
+        )
+
+        clear_btn = gr.Button(
+            "대화 초기화",
+            variant="secondary",
+            elem_id="clear-btn"
         )
 
     # ======================================
@@ -772,14 +826,19 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
     ask_btn.click(
         fn=ask_question,
-        inputs=[question, db_state],
-        outputs=output
+        inputs=[question, chatbot, db_state],
+        outputs=[chatbot, question]
     )
 
     question.submit(
         fn=ask_question,
-        inputs=[question, db_state],
-        outputs=output
+        inputs=[question, chatbot, db_state],
+        outputs=[chatbot, question]
+    )
+
+    clear_btn.click(
+        fn=clear_chat,
+        outputs=chatbot
     )
 
     demo.unload(cleanup_session)
