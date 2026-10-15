@@ -284,6 +284,50 @@ class QuestionLockMessageTest(unittest.TestCase):
             self.assertIn("등록에 성공해야 질문할 수 있습니다", app.register_pdf(["/tmp/x.pdf"], request)[1])
 
 
+class AnswerInProgressLockTest(unittest.TestCase):
+    """#62: 답변 생성 중에는 다음 질문을 보낼 수 없어야 함"""
+
+    def test_start_answer_locks_everything_without_clearing_question(self):
+        locked = app.start_answer()
+        self.assertEqual(len(locked), 6)
+        self.assertTrue(all(update["interactive"] is False for update in locked))
+        self.assertEqual(locked[0]["placeholder"], app.QUESTION_ANSWERING)
+        self.assertNotIn("value", locked[0])                    # 입력한 질문이 ask_question에 그대로 전달돼야 함
+
+    def test_finish_answer_with_db_reopens_question(self):
+        unlocked = app.finish_answer(Mock())
+        self.assertTrue(all(update["interactive"] is True for update in unlocked))
+        self.assertEqual(unlocked[0]["placeholder"], app.QUESTION_READY)
+
+    def test_finish_answer_without_db_keeps_question_locked(self):
+        unlocked = app.finish_answer(None)
+        self.assertFalse(unlocked[0]["interactive"])
+        self.assertFalse(unlocked[1]["interactive"])
+        self.assertEqual(unlocked[0]["placeholder"], app.QUESTION_NO_PDF)
+        self.assertTrue(all(update["interactive"] is True for update in unlocked[2:]))  # 등록·초기화는 다시 가능
+
+    def test_both_triggers_use_lock_ask_unlock_chain(self):
+        config = app.demo.get_config_file()
+        ids = {c["props"].get("elem_id"): c["id"] for c in config["components"]}
+        deps = config["dependencies"]
+        fns = list(app.demo.fns.values())
+
+        for elem_id, event in (("ask-btn", "click"), ("question-box", "submit")):
+            first = [i for i, dep in enumerate(deps)
+                     if [ids[elem_id], event] in [list(t) for t in dep["targets"]]]
+            self.assertEqual(len(first), 1)                     # 같은 트리거에 중복 등록 없음
+            chain = [first[0]]
+            while True:
+                nxt = [i for i, dep in enumerate(deps) if dep.get("trigger_after") == chain[-1]]
+                if not nxt:
+                    break
+                chain.append(nxt[0])
+            self.assertEqual([fns[i].fn.__name__ for i in chain],
+                             ["start_answer", "ask_question", "finish_answer"])
+            self.assertFalse(deps[chain[0]]["queue"])           # 잠금은 큐를 기다리지 않고 즉시 적용
+            self.assertFalse(deps[chain[2]]["trigger_only_on_success"])  # 오류가 나도 잠금 해제
+
+
 class AnswerCacheTest(unittest.TestCase):
     """#24: 새 PDF DB에서 이전 PDF의 캐시 답변이 반환되면 안 됨"""
 

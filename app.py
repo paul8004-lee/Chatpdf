@@ -1082,6 +1082,41 @@ def finish_register(db, message):
 # 5. 질문 및 스트리밍 답변
 # ==========================================
 
+# 답변 생성 중에는 다음 질문을 막아 순서 섞임·중복 요청·추가 비용을 방지 (#62)
+QUESTION_ANSWERING = "⏳ 답변을 생성하는 중입니다. 완료되면 다음 질문을 할 수 있습니다."
+
+
+def start_answer():
+    # 질문 전송 즉시(queue=False) 질문창·질문하기와 DB/대화를 바꾸는 버튼을 잠금 (#62)
+    # 질문창은 value를 건드리지 않아야 다음 단계(ask_question)가 입력한 질문을 그대로 받음
+    locked = gr.update(interactive=False)
+
+    return (
+        gr.update(interactive=False, placeholder=QUESTION_ANSWERING),
+        locked,                                                  # 질문하기
+        locked,                                                  # PDF 선택
+        locked,                                                  # 파일 등록
+        locked,                                                  # 선택 초기화
+        locked                                                   # 대화 초기화
+    )
+
+
+def finish_answer(db):
+    # 답변이 끝나면(오류로 끝나도) 등록된 DB가 있을 때만 질문을 다시 허용 (#62, #55)
+    can_ask = db is not None
+    placeholder = QUESTION_READY if can_ask else QUESTION_NO_PDF
+    unlocked = gr.update(interactive=True)
+
+    return (
+        gr.update(interactive=can_ask, placeholder=placeholder),
+        gr.update(interactive=can_ask),
+        unlocked,
+        unlocked,
+        unlocked,
+        unlocked
+    )
+
+
 def ask_question(question, history, db, request: gr.Request):
     with request_log.request(LOG_PATH, "qa", secrets=(OPENAI_API_KEY,), activate=False) as trace:
         yield from request_log.iterate(trace, _ask_question(question, history, db, request))
@@ -1319,17 +1354,32 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
         ]
     )
 
-    ask_btn.click(
-        fn=ask_question,
-        inputs=[question, chatbot, db_state],
-        outputs=[chatbot, question]
-    )
+    # 질문하기 / Enter 전송: 잠금 → 스트리밍 답변 → 잠금 해제 (#62)
+    # 잠금 해제는 .then이라 ask_question이 gr.Error로 끝나도 실행됨
+    answer_lock_outputs = [
+        question,
+        ask_btn,
+        pdf_file,
+        upload_btn,
+        reset_select_btn,
+        clear_btn
+    ]
 
-    question.submit(
-        fn=ask_question,
-        inputs=[question, chatbot, db_state],
-        outputs=[chatbot, question]
-    )
+    for trigger in (ask_btn.click, question.submit):
+        trigger(
+            fn=start_answer,
+            outputs=answer_lock_outputs,
+            queue=False
+        ).then(
+            fn=ask_question,
+            inputs=[question, chatbot, db_state],
+            outputs=[chatbot, question]
+        ).then(
+            fn=finish_answer,
+            inputs=[db_state],
+            outputs=answer_lock_outputs,
+            queue=False
+        )
 
     clear_btn.click(
         fn=clear_chat,
