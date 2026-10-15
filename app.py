@@ -681,20 +681,41 @@ _sessions_guard = threading.Lock()
 # 2. 팀 로고 불러오기
 # ==========================================
 
+# 원본 hyundap_logo.png(1254×1254, 1.2MB)를 base64로 그대로 넣으면 HTML과 /config에
+# 두 번 실려 첫 로드가 약 3.4MB였음. 또 Hugging Face Spaces는 일반 git으로 push한
+# 바이너리 파일을 거부함 → 화면 표시 크기(27~36px)의 2배인 72×72로 줄이고 64색으로
+# 압축한 PNG(948 bytes)를 문자열로 코드에 직접 넣고, 이미지 파일은 저장소에서 뺌 (#60)
+LOGO_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEgAAABICAMAAABiM0N1AAAAwFBMVEX9/f0YlFQJjUgIRynK"
+    "19Hl7Ol+w6AYVDfP5NqGpZcAPBwyZ06Jyah1mYhXg26YsqY3o2tNe2W6zMTZ6+JouZBIqnci"
+    "mFuku7AkXEGz3MdCdFwrnWFjjHk+cFl5wZ1ZsoSvxLqj1bshWj674M6RrqBqkX8ALAqb0bYA"
+    "PyDe8Od/opIAhj5Tr4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAVEFlRAAAAQHRSTlP/////////////////////////////////"
+    "//////////////////////////8AAAAAAAAAAAAAAAAAAAAAAAAAFPfcwQAAAmNJREFUeNrt"
+    "lWt3oyAQhpGBghfiJcZbLk2aJm139///vh3QJpp6opGcPfvB94MI4iMD74yEzJo163/Rn/Q5"
+    "nJI68imgteNEz+Ck1HFoYM85Okb2wUU1aGXL2dEaZBucdC5aWoFWFw59teEE9LoiepjOWTpt"
+    "WZhpRdugcjLn0ObQj+kLytqcwC43LhxTAMrAIjdqjjH2VzbJTFELtP4eWdlZqE5ZUwYONhai"
+    "5ZWcWVioPrBje9cfWJDUMudGd2bg4oXjY+VVNuvKmmSNpmVKSpvp6+YmpZOsWTrfC5Hrrx9H"
+    "+ICZopsPl50qQEeb6YV26323mow3k+zY+cbjzgNmWt0U11d6Cxpnpg/aPZ/gB2fkby7rzi/7"
+    "OGPMlDpZO+uXfRh0x6CZDr/pVXjSEV56NRRcsAtergp2nW7rQTr9V/DvxdjgFM5GHDsXYjAZ"
+    "Q28xAvQmBufko0Diba9UQkIXQ2RuzhS2octzN9HDSNm4LixMi4+5m+83SvavCFCJOseExGfl"
+    "nhUhvsd8PQo52XgAAkELT/cr9onXT9Gzr7yAd65ggXvFuQAeei6CgMWg+C9YMPCZrGCT6DbG"
+    "vhB6etwXWoEhwRY/GYZeTNwGVMESh2PT3Xsn0yYGjC8JcQeE3/RhjyDVrEjWIKVP7fRu2gYk"
+    "9Ts9m12DyBb0pASKUOGNb0AVhuK6AjYSTBszgDisvFMPyPc1CIPOAUIcUOBBsSdbgSBRkVx4"
+    "4ONmh3XLoMCbuPf8ub5o20HBTclN2GUYLxy7y6aVHEPjyd1c4JXQ2zCYUGaz75Z+EBvyDBBh"
+    "/Fk5PmvWrKv+Aq3BHimNNcEpAAAAAElFTkSuQmCC"
+)
+
+
 def get_logo_html():
-    logo_path = Path(__file__).with_name("hyundap_logo.png")
-
-    if logo_path.exists():
-        encoded = base64.b64encode(
-            logo_path.read_bytes()
-        ).decode("utf-8")
-
+    if LOGO_PNG_BASE64:
         return (
             '<img class="team-logo" '
-            f'src="data:image/png;base64,{encoded}" '
+            f'src="data:image/png;base64,{LOGO_PNG_BASE64}" '
             'alt="hyundap 로고">'
         )
 
+    # 로고 데이터가 없으면 책 아이콘으로 대체
     return '<span class="logo-fallback">📚</span>'
 
 
@@ -789,10 +810,26 @@ footer {
    상단 로고 + 제목
 ========================= */
 
+/* 제목 줄: 두 칸 너비를 Gradio 기본(flex: 1, 최소 210px+100px)이 아닌 실제 내용 폭으로 계산하고
+   줄바꿈을 허용 → 좁은 화면(320·375px)에서 제목과 토글이 한 줄에 안 들어가면
+   토글이 제목 아래 줄로 내려가 카드 밖으로 잘리지 않음 (#75) */
 #title-row {
     align-items: center !important;
-    flex-wrap: nowrap !important;
+    flex-wrap: wrap !important;
     gap: 8px !important;
+}
+
+#title-col {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+}
+
+#mode-col {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    margin-left: auto !important;
 }
 
 .brand-header {
@@ -832,6 +869,8 @@ footer {
     border: none !important;
     padding: 0 !important;
     min-width: 0 !important;
+    width: auto !important;
+    overflow: visible !important;   /* 라벨 글자가 상자 밖에서 잘리지 않게 (#75) */
 }
 
 #mode-select label,
@@ -1003,11 +1042,13 @@ footer {
     background: var(--chat-bg) !important;
 }
 
-/* 사용자 말풍선 */
+/* 사용자 말풍선
+   흰 글자 대비가 #6478ed에서 3.85:1로 부족해 같은 계열의 더 진한 파랑으로 바꿈
+   → 5.00:1(WCAG AA 4.5:1 이상), 라이트·다크 공통 (#63) */
 
 #chat-box .message.user,
 #chat-box .message.user.message {
-    background: #6478ed !important;
+    background: #5064dc !important;
     color: #ffffff !important;
     border: none !important;
     border-radius: 16px !important;
@@ -1284,23 +1325,12 @@ footer {
     }
 }
 
-/* 320px: 제목 줄이 넘쳐 다크모드 토글이 카드 밖으로 잘리던 문제 */
+/* 320px: 제목 글자를 조금 줄이고, 그래도 넘치면 제목 안에서 줄바꿈
+   (토글 줄바꿈은 위 #title-row 규칙이 처리, #75) */
 @media (max-width: 360px) {
-    #title-row {
-        flex-wrap: wrap !important;
-    }
-
-    #title-row > * {
-        min-width: 0 !important;
-    }
-
     .page-title {
         white-space: normal;
         font-size: 15px;
-    }
-
-    #mode-select {
-        max-width: 100% !important;
     }
 }
 """
@@ -1831,7 +1861,8 @@ with gr.Blocks(
 
             with gr.Column(
                 scale=6,
-                min_width=210
+                min_width=210,
+                elem_id="title-col"
             ):
 
                 gr.HTML(f"""
@@ -1845,7 +1876,8 @@ with gr.Blocks(
 
             with gr.Column(
                 scale=1,
-                min_width=100
+                min_width=100,
+                elem_id="mode-col"
             ):
 
                 dark_mode = gr.Checkbox(
