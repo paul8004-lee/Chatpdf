@@ -75,7 +75,12 @@ class PDFWorkflowTest(unittest.TestCase):
             self.assertNotEqual(db._collection.name, new_db._collection.name)
             db.delete_collection()
             new_db.delete_collection()
-            failed_db, message = app.build_db([str(first), str(broken)], "test")
+            # #42: 손상된 파일은 제외하고 정상 파일만 등록
+            partial_db, message = app.build_db([str(first), str(broken)], "test")
+            self.assertIn("broken.pdf", message)
+            self.assertIsNotNone(partial_db)
+            partial_db.delete_collection()
+            failed_db, message = app.build_db([str(broken)], "test")
             self.assertIn("broken.pdf", message)
             self.assertIsNone(failed_db)
             # A failure while embedding the second file must remove partial chunks.
@@ -99,6 +104,49 @@ class PDFWorkflowTest(unittest.TestCase):
             single_db, message = app.build_db(str(replacement), "test")
             self.assertIn("1개 파일", message)
             single_db.delete_collection()
+
+
+class PartialFailureTest(unittest.TestCase):
+    """#42: PDF 1개가 실패해도 나머지 PDF는 등록되어야 함"""
+
+    def test_failed_files_are_skipped_with_reason(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            app, "OpenAIEmbeddings", return_value=LocalEmbeddings()
+        ):
+            good, image_only, broken = [Path(folder) / name for name in
+                                        ("good.pdf", "image_only.pdf", "broken.pdf")]
+            write_pdf(good, ["apple orchard", "apple harvest"])
+            write_pdf(image_only, [""])
+            broken.write_text("invalid PDF")
+            db, message = app.build_db([str(image_only), str(good), str(broken)], "test")
+            self.assertIsNotNone(db)
+            self.assertIn("1개 파일 · 2페이지", message)
+            self.assertIn("제외된 파일 2개", message)
+            self.assertIn("image_only.pdf: 텍스트가 없는 PDF", message)
+            self.assertIn("broken.pdf: PDF를 읽을 수 없음", message)
+            self.assertEqual({d.metadata["source_filename"] for d in db.similarity_search("apple", k=5)},
+                             {"good.pdf"})
+            db.delete_collection()
+
+    def test_all_failed_returns_none_with_every_reason(self):
+        with tempfile.TemporaryDirectory() as folder:
+            image_only, broken = Path(folder) / "image_only.pdf", Path(folder) / "broken.pdf"
+            write_pdf(image_only, [""])
+            broken.write_text("invalid PDF")
+            db, message = app.build_db([str(image_only), str(broken)], "test")
+        self.assertIsNone(db)
+        self.assertIn("등록할 수 있는 PDF가 없습니다", message)
+        self.assertIn("image_only.pdf", message)
+        self.assertIn("broken.pdf", message)
+
+    def test_embedding_failure_still_fails_everything(self):
+        with tempfile.TemporaryDirectory() as folder:
+            good = Path(folder) / "good.pdf"
+            write_pdf(good, ["apple orchard"])
+            with patch.object(app, "OpenAIEmbeddings", side_effect=RuntimeError("bad key")):
+                db, message = app.build_db([str(good)], "test")
+        self.assertIsNone(db)
+        self.assertIn("API 키/연결", message)
 
 
 class AnswerCacheTest(unittest.TestCase):
