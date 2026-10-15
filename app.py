@@ -79,7 +79,7 @@ MAX_HISTORY_TURNS = 3            # 후속 질문을 이해하려고 참고할 '�
 CACHE_SIZE = 100                 # 답변 캐시(임시 저장소)에 보관할 최대 질문 수
 LOG_PATH = Path("eval/qa_log.jsonl")  # 질문별 성능 기록을 저장할 파일 위치
 
-_answer_cache = {}               # 답변 캐시: {(PDF DB 번호, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
+_answer_cache = {}               # 답변 캐시: {(PDF 컬렉션 이름, 질문): 답변} 형태로 저장. 앱을 끄면 사라짐
 
 # ---------- 프롬프트 1: 멀티쿼리 (검색어 늘리기) ----------
 # 질문 하나로만 검색하면 표현이 조금만 달라도 관련 내용을 놓칠 수 있음.
@@ -159,16 +159,28 @@ def _rerank(llm, docs, query):
         return docs[:TOP_K]                                     #   답변은 계속되도록 원래 순서의 앞 TOP_K개를 사용
 
 
+def _cache_key(db):
+    """캐시에서 PDF DB를 구분하는 열쇠. id(db)는 DB 해제 후 재사용될 수 있어 컬렉션 이름(UUID)을 사용함 (#24)"""
+    return getattr(db, "_collection_name", None) or id(db)       # build_db가 만든 컬렉션 이름: pdf_<uuid>
+
+
 def _cache_get(db, query):
     """[업그레이드 2] 같은 PDF(db)에 같은 질문(query)을 한 적이 있으면 저장해 둔 답변을 꺼냄. 없으면 None."""
-    return _answer_cache.get((id(db), query))                   # id(db): 지금 올린 PDF 데이터베이스를 구분하는 고유 번호
+    return _answer_cache.get((_cache_key(db), query))
 
 
 def _cache_put(db, query, text):
     """[업그레이드 2] 새로 만든 답변을 캐시에 저장함."""
     if len(_answer_cache) >= CACHE_SIZE:                        # 캐시가 가득 찼으면
         _answer_cache.pop(next(iter(_answer_cache)))            #   가장 먼저 저장된(가장 오래된) 답변 1개를 지움
-    _answer_cache[(id(db), query)] = text                       # (PDF 번호, 질문)을 열쇠로 답변을 저장
+    _answer_cache[(_cache_key(db), query)] = text               # (PDF 컬렉션 이름, 질문)을 열쇠로 답변을 저장
+
+
+def _cache_clear(db):
+    """DB를 삭제·교체할 때 그 DB로 만든 답변을 캐시에서 지움 (#24)"""
+    key = _cache_key(db)
+    for cache_key in [k for k in list(_answer_cache) if k[0] == key]:
+        _answer_cache.pop(cache_key, None)
 
 
 def _log(**record):
@@ -582,6 +594,8 @@ def _session_lock(request):
 def _delete_db(db):
     if db is None:
         return
+
+    _cache_clear(db)
 
     try:
         db.delete_collection()

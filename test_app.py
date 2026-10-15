@@ -101,5 +101,38 @@ class PDFWorkflowTest(unittest.TestCase):
             single_db.delete_collection()
 
 
+class AnswerCacheTest(unittest.TestCase):
+    """#24: 새 PDF DB에서 이전 PDF의 캐시 답변이 반환되면 안 됨"""
+
+    def setUp(self):
+        app._answer_cache.clear()
+
+    def test_cache_survives_id_reuse(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            app, "OpenAIEmbeddings", return_value=LocalEmbeddings()
+        ):
+            old_pdf, new_pdf = Path(folder) / "old.pdf", Path(folder) / "new.pdf"
+            write_pdf(old_pdf, ["apple orchard"])
+            write_pdf(new_pdf, ["banana plantation"])
+            old_db, _ = app.build_db([str(old_pdf)], "test")
+            new_db, _ = app.build_db([str(new_pdf)], "test")
+            # 이전 DB가 해제된 뒤 새 DB가 같은 id()를 받은 상황을 재현
+            with patch.object(app, "id", create=True, side_effect=lambda obj: 1):
+                app._cache_put(old_db, "q", "old answer")
+                self.assertIsNone(app._cache_get(new_db, "q"))
+                self.assertEqual(app._cache_get(old_db, "q"), "old answer")
+            app._delete_db(old_db)
+            app._delete_db(new_db)
+
+    def test_delete_db_clears_its_cache_only(self):
+        first, second = Mock(_collection_name="pdf_a"), Mock(_collection_name="pdf_b")
+        app._cache_put(first, "q", "A")
+        app._cache_put(second, "q", "B")
+        app._delete_db(first)
+        first.delete_collection.assert_called_once_with()
+        self.assertIsNone(app._cache_get(first, "q"))
+        self.assertEqual(app._cache_get(second, "q"), "B")
+
+
 if __name__ == "__main__":
     unittest.main()
