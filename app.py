@@ -73,7 +73,7 @@ def build_db(pdf_path):  # [삭제 대상] Step 1 담당자의 build_db로 대�
     )
 
 
-def answer(question, db):  # [삭제 대상] Step 2의 answer로 대체
+def answer(question, openai_key, db, history=None):  # [삭제 대상] Step 2의 answer로 대체
     if db is None:
         return "먼저 PDF 파일을 등록해주세요."
 
@@ -239,6 +239,30 @@ footer {
     font-size: 12px !important;
 }
 
+/* API 키 입력창 */
+
+#api-key-box {
+    background: var(--field) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+    box-shadow: none !important;
+}
+
+#api-key-box input {
+    background: transparent !important;
+    color: var(--fg) !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+
+#api-key-box input::placeholder {
+    color: var(--muted) !important;
+}
+
+#api-key-box:focus-within {
+    border-color: #827aff !important;
+}
+
 /* 질문 입력창 */
 
 #question-box {
@@ -374,8 +398,9 @@ def register_pdf(pdf_path):
     return build_db(pdf_path)
 
 
-def ask_question(question, history, db): # 리스트 안에 이전 대화 기록 적재
+def ask_question(question, openai_key, history, db): # 리스트 안에 이전 대화 기록 적재
     history = list(history or [])
+    prior_history = list(history)  # 이번 질문을 넣기 전의 기록 (answer에 맥락으로 전달)
 
     # 빈 질문: 챗봇 안에 안내 메시지만 추가
     if not question or not question.strip():
@@ -396,7 +421,7 @@ def ask_question(question, history, db): # 리스트 안에 이전 대화 기록
     yield history, ""
 
     try:
-        result = answer(question, db)
+        result = answer(question, openai_key, db, prior_history)
 
         # answer가 문자열이면 한 번에, yield(스트리밍)이면 조각마다 갱신
         if isinstance(result, str):
@@ -476,6 +501,20 @@ with gr.Blocks(title="[현답] 문서 질의응답 서비스") as demo:
             elem_id="upload-status"
         )
 
+        # OpenAI API 키 (테스트 모드에서는 비워 둬도 됨)
+        gr.HTML(
+            '<div class="section-label">🔑 OpenAI API 키</div>'
+        )
+
+        openai_key = gr.Textbox(
+            placeholder="sk-... (테스트 모드에서는 비워 두세요)",
+            type="password",
+            show_label=False,
+            container=False,
+            lines=1,
+            elem_id="api-key-box"
+        )
+
         # 질문
         gr.HTML(
             '<div class="section-label">💬 질문</div>'
@@ -533,13 +572,13 @@ with gr.Blocks(title="[현답] 문서 질의응답 서비스") as demo:
 
     ask_btn.click(
         fn=ask_question,
-        inputs=[question, chatbot, db_state],
+        inputs=[question, openai_key, chatbot, db_state],
         outputs=[chatbot, question]
     )
 
     question.submit(
         fn=ask_question,
-        inputs=[question, chatbot, db_state],
+        inputs=[question, openai_key, chatbot, db_state],
         outputs=[chatbot, question]
     )
 
