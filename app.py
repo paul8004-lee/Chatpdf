@@ -282,7 +282,7 @@ def answer(question, openai_key, db, history=None):
     except openai.APIConnectionError:                           # 인터넷 연결 문제 등으로 OpenAI 서버에 접속 못 한 경우
         raise gr.Error("OpenAI 서버에 연결할 수 없습니다. 네트워크를 확인하세요.")
 
-# ===== Step 3. 화면 (feature/chat-ui) =====
+
 # ===== Step 3. 화면 (feature/chat-ui) =====
 
 import os
@@ -291,21 +291,21 @@ import gradio as gr
 from pathlib import Path
 from dotenv import load_dotenv
 
-# .env의 OPENAI_API_KEY를 환경변수로 읽어옴 (Spaces에서는 Secrets에 등록)
+
+# ==========================================
+# 1. 환경변수 및 세션 관리
+# ==========================================
+
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# 세션(브라우저 탭)별 현재 DB와 잠금
-# - DB: 재등록·세션 종료 시 이전 Chroma 컬렉션을 삭제하기 위해 기록 (#30)
-# - 잠금: 답변 생성 중에 DB가 삭제·교체되지 않도록 질문과 DB 교체를 순서대로 처리 (#32)
 _session_dbs = {}
 _session_locks = {}
 _sessions_guard = threading.Lock()
 
 
-
 # ==========================================
-# 1. CSS 디자인 + 다크모드
+# 2. CSS 디자인 + 다크모드
 # ==========================================
 
 CSS = """
@@ -327,8 +327,6 @@ CSS = """
     font-family: 'Pretendard', Arial, sans-serif !important;
 }
 
-/* 기본 배경 */
-
 html, body {
     background: #FFFFFF !important;
 }
@@ -340,9 +338,7 @@ body:has(#mode-select input[type="checkbox"]:checked) {
     background: #11141C !important;
 }
 
-.gradio-container:has(
-    #mode-select input[type="checkbox"]:checked
-) {
+.gradio-container:has(#mode-select input[type="checkbox"]:checked) {
     --page: #11141C;
     --card: #1A1E2B;
     --field: #252B3A;
@@ -350,7 +346,6 @@ body:has(#mode-select input[type="checkbox"]:checked) {
     --fg: #F3F5FA;
     --muted: #ACB5C8;
     --line: #394256;
-
     color-scheme: dark;
 }
 
@@ -406,10 +401,7 @@ footer {
     height: 3px;
     border-radius: 99px;
     background: linear-gradient(
-        90deg,
-        #329AFF,
-        #8578FF,
-        #FF65AF
+        90deg, #329AFF, #8578FF, #FF65AF
     );
     margin: 3px 0 9px;
 }
@@ -423,7 +415,7 @@ footer {
     margin: 0 0 5px;
 }
 
-/* PDF 파일 업로드 */
+/* PDF 업로드 */
 
 #file-row {
     align-items: stretch !important;
@@ -451,8 +443,6 @@ footer {
     border-radius: 11px !important;
     min-height: 45px !important;
 }
-
-/* 업로드 상태 */
 
 #upload-status,
 #upload-status * {
@@ -482,7 +472,7 @@ footer {
     padding: 14px !important;
     font-size: 14px !important;
     line-height: 1.6 !important;
-    min-height: 100px !important;
+    min-height: 60px !important;
 }
 
 #question-box textarea::placeholder {
@@ -515,24 +505,46 @@ footer {
     filter: brightness(1.06);
 }
 
-/* 답변 영역 */
+/* 채팅 영역 */
 
-#answer-box {
+#chat-box {
     background: var(--answer) !important;
     border: 1px solid var(--line) !important;
     border-left: 4px solid #827AFF !important;
     border-radius: 12px !important;
-    padding: 16px !important;
-    min-height: 90px;
     box-shadow: none !important;
 }
 
-#answer-box,
-#answer-box * {
+#chat-box .message {
+    border: 1px solid var(--line) !important;
+}
+
+#chat-box .message.user {
+    background: var(--field) !important;
+}
+
+#chat-box .message.bot,
+#chat-box .message.assistant {
+    background: var(--card) !important;
+}
+
+#chat-box,
+#chat-box * {
     color: var(--fg) !important;
 }
 
-/* 모바일 대응 */
+/* 초기화 버튼 */
+
+#clear-btn {
+    background: var(--answer) !important;
+    color: var(--fg) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+    min-height: 40px !important;
+    box-shadow: none !important;
+}
+
+/* 모바일 */
 
 @media (max-width: 600px) {
     .gradio-container {
@@ -555,58 +567,89 @@ footer {
 """
 
 
-
 # ==========================================
-# 2. UI 이벤트 함수
+# 3. 세션 및 DB 관리 함수
 # ==========================================
 
 def _session_lock(request):
     with _sessions_guard:
-        return _session_locks.setdefault(request.session_hash, threading.Lock())
+        return _session_locks.setdefault(
+            request.session_hash,
+            threading.Lock()
+        )
 
 
 def _delete_db(db):
-    # 정리에 실패해도 원래 처리 결과를 덮어쓰지 않도록 예외는 기록만 함 (#25)
     if db is None:
         return
+
     try:
         db.delete_collection()
     except Exception:
         logging.getLogger(__name__).exception("Chroma 컬렉션 삭제 실패")
 
 
+# ==========================================
+# 4. PDF 다중 업로드
+# ==========================================
+
 def select_pdf(files):
-    # 여러 PDF 선택 지원 (#31): 단일 파일이 와도 목록으로 맞춤
+
     if not files:
-        return None, "파일을 선택해주세요."
+        return None, "📎 PDF 파일을 선택해주세요."
 
     if not isinstance(files, list):
         files = [files]
-    paths = [f if isinstance(f, str) else f.name for f in files]
-    names = ", ".join(Path(p).name for p in paths)
 
-    return paths, f"선택한 파일 ({len(paths)}개): {names}"
+    paths = [
+        f if isinstance(f, str) else f.name
+        for f in files
+    ]
+
+    filenames = [Path(path).name for path in paths]
+
+    status = (
+        f"✅ 총 {len(paths)}개 PDF 선택 완료\n\n"
+        + "\n".join(
+            f"- 📄 {name}"
+            for name in filenames
+        )
+    )
+
+    return paths, status
 
 
 def start_register(request: gr.Request):
-    # 등록 시작: 이전 DB 참조 해제·컬렉션 삭제 후 질문과 재등록을 막음 (#30, #32)
-    # 잠금을 기다리므로 이미 답변 중인 질문이 끝난 뒤에 DB를 삭제함
+
     with _session_lock(request):
-        _delete_db(_session_dbs.pop(request.session_hash, None))
+        _delete_db(
+            _session_dbs.pop(request.session_hash, None)
+        )
 
     locked = gr.update(interactive=False)
-    return None, "⏳ PDF 처리 중입니다... 완료 후 질문할 수 있습니다.", locked, locked, locked, locked
+
+    return (
+        None,
+        "⏳ PDF 처리 중입니다... 완료 후 질문할 수 있습니다.",
+        locked,
+        locked,
+        locked,
+        locked
+    )
 
 
 def register_pdf(pdf_paths, request: gr.Request):
+
     if not pdf_paths:
-        return None, "PDF 파일을 선택해주세요."
+        return None, "⚠️ PDF 파일을 선택해주세요."
 
     if not OPENAI_API_KEY:
-        return None, ":warning: OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요."
+        return (
+            None,
+            "⚠️ OPENAI_API_KEY가 없습니다. .env 파일을 확인해주세요."
+        )
 
-    # 선택한 PDF 전체 목록을 한 번에 넘겨 통합 검색 DB를 만듦 (#31)
-    # 실패하면 None이 반환되고 기존 DB는 복구하지 않음 (#32)
+    # 여러 PDF를 하나의 DB로 처리
     db, message = build_db(pdf_paths, OPENAI_API_KEY)
 
     if db is not None:
@@ -617,48 +660,100 @@ def register_pdf(pdf_paths, request: gr.Request):
 
 
 def finish_register(db):
-    # 새 DB가 만들어졌을 때만 질문 허용, 업로드는 다시 가능하게 (#32)
+
     can_ask = gr.update(interactive=db is not None)
-    return can_ask, can_ask, gr.update(interactive=True), gr.update(interactive=True)
+
+    return (
+        can_ask,
+        can_ask,
+        gr.update(interactive=True),
+        gr.update(interactive=True)
+    )
 
 
-def ask_question(question, db, request: gr.Request):
-    # answer()가 yield로 답변을 조금씩 내보내므로 그대로 화면에 전달
+# ==========================================
+# 5. 질문 및 스트리밍 답변
+# ==========================================
+
+def ask_question(question, history, db, request: gr.Request):
+
+    history = list(history or [])
+    prior_history = list(history)
+
     if not question or not question.strip():
-        yield ":warning: 질문을 입력해주세요."
+        history.append({
+            "role": "assistant",
+            "content": "⚠️ 질문을 입력해주세요."
+        })
+        yield history, ""
         return
 
+    history.append({
+        "role": "user",
+        "content": question
+    })
+
     with _session_lock(request):
-        # 처리 중이거나 이미 교체된 DB로는 답하지 않음 (#32)
+
         if db is None or db is not _session_dbs.get(request.session_hash):
-            yield "먼저 PDF 파일을 등록해주세요."
+            history.append({
+                "role": "assistant",
+                "content": "⚠️ PDF를 선택한 뒤 파일 등록 버튼을 눌러주세요."
+            })
+            yield history, ""
             return
 
+        history.append({
+            "role": "assistant",
+            "content": "🤖 답변을 생성하는 중..."
+        })
+        yield history, ""
+
         try:
-            yield from answer(question, OPENAI_API_KEY, db)
-        except gr.Error:
-            raise
+            result = answer(
+                question,
+                OPENAI_API_KEY,
+                db,
+                prior_history
+            )
+
+            if isinstance(result, str):
+                history[-1]["content"] = result
+                yield history, ""
+
+            else:
+                for text in result:
+                    history[-1]["content"] = str(text)
+                    yield history, ""
+
         except Exception as e:
-            yield f":warning: 답변 처리 오류: {e}"
+            history[-1]["content"] = f"⚠️ 답변 처리 오류: {e}"
+            yield history, ""
+
+
+def clear_chat():
+    return []
 
 
 def cleanup_session(request: gr.Request):
-    # 브라우저 탭을 닫으면 그 세션의 컬렉션을 정리 (#30)
+
     with _session_lock(request):
-        _delete_db(_session_dbs.pop(request.session_hash, None))
+        _delete_db(
+            _session_dbs.pop(request.session_hash, None)
+        )
+
     with _sessions_guard:
         _session_locks.pop(request.session_hash, None)
 
 
-
 # ==========================================
-# 3. Gradio Blocks UI
+# 6. Gradio Blocks UI
 # ==========================================
 
 with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
     db_state = gr.State(value=None)
-    selected_file = gr.State(value=None)
+    selected_files = gr.State(value=None)
 
     with gr.Column(elem_id="main-card"):
 
@@ -668,13 +763,13 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             with gr.Column(scale=5, min_width=180):
                 gr.HTML("""
                 <div class="page-title">
-                    문서 질의응답 서비스
+                    📚 문서 질의응답 서비스
                 </div>
                 """)
 
             with gr.Column(scale=1, min_width=110):
                 dark_mode = gr.Checkbox(
-                    label=":crescent_moon: 다크모드",
+                    label="🌙 다크모드",
                     value=False,
                     container=False,
                     elem_id="mode-select"
@@ -682,15 +777,15 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
         gr.HTML('<div class="gradient-line"></div>')
 
-        # PDF 업로드
+        # PDF 다중 업로드
         gr.HTML(
-            '<div class="section-label">:page_facing_up: PDF 파일</div>'
+            '<div class="section-label">📚 PDF 다중 문서 업로드</div>'
         )
 
         with gr.Row(elem_id="file-row"):
 
             pdf_file = gr.UploadButton(
-                ":paperclip: PDF 파일 선택",
+                "📎 PDF 여러 개 선택",
                 file_types=[".pdf"],
                 file_count="multiple",
                 type="filepath",
@@ -701,7 +796,7 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             )
 
             upload_btn = gr.Button(
-                "파일 등록",
+                "📂 파일 등록",
                 variant="secondary",
                 scale=2,
                 min_width=95,
@@ -709,84 +804,109 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             )
 
         status = gr.Markdown(
-            "파일을 선택해주세요.",
+            "📁 등록된 문서가 없습니다.",
             elem_id="upload-status"
         )
 
         # 질문
         gr.HTML(
-            '<div class="section-label">:speech_balloon: 질문</div>'
+            '<div class="section-label">💬 질문</div>'
         )
 
         question = gr.Textbox(
-            placeholder="문서에 대해 궁금한 내용을 입력하세요...",
+            placeholder="💬 여러 PDF 문서에 대해 질문하세요...",
             show_label=False,
             container=False,
-            lines=3,
+            lines=1,
             max_lines=5,
             interactive=False,
             elem_id="question-box"
         )
 
         ask_btn = gr.Button(
-            "질문하기 →",
+            "🚀 질문하기 →",
             variant="primary",
             interactive=False,
             elem_id="ask-btn"
         )
 
-        # 답변
+        # AI 대화
         gr.HTML(
-            '<div class="section-label">:sparkles: 답변</div>'
+            '<div class="section-label">✨ AI 대화</div>'
         )
 
-        output = gr.Markdown(
-            "질문을 입력하면 이곳에 답변이 표시됩니다.",
-            elem_id="answer-box"
+        chatbot = gr.Chatbot(
+            placeholder="🤖 질문을 입력하면 이곳에 대화가 쌓입니다.",
+            show_label=False,
+            layout="bubble",
+            height=400,
+            elem_id="chat-box"
+        )
+
+        # 대화 초기화
+        clear_btn = gr.Button(
+            "🗑️ 대화 초기화",
+            variant="secondary",
+            elem_id="clear-btn"
         )
 
     # ======================================
-    # 4. 이벤트 핸들러
+    # 7. 이벤트 핸들러
     # ======================================
 
     pdf_file.upload(
         fn=select_pdf,
         inputs=[pdf_file],
-        outputs=[selected_file, status]
+        outputs=[selected_files, status]
     )
 
-    # 등록: 시작(이전 DB 정리·입력 잠금) → DB 생성 → 결과에 따라 질문 허용
     upload_btn.click(
         fn=start_register,
-        outputs=[db_state, status, question, ask_btn, pdf_file, upload_btn]
+        outputs=[
+            db_state,
+            status,
+            question,
+            ask_btn,
+            pdf_file,
+            upload_btn
+        ]
     ).then(
         fn=register_pdf,
-        inputs=[selected_file],
+        inputs=[selected_files],
         outputs=[db_state, status]
     ).then(
         fn=finish_register,
         inputs=[db_state],
-        outputs=[question, ask_btn, pdf_file, upload_btn]
+        outputs=[
+            question,
+            ask_btn,
+            pdf_file,
+            upload_btn
+        ]
     )
 
     ask_btn.click(
         fn=ask_question,
-        inputs=[question, db_state],
-        outputs=output
+        inputs=[question, chatbot, db_state],
+        outputs=[chatbot, question]
     )
 
     question.submit(
         fn=ask_question,
-        inputs=[question, db_state],
-        outputs=output
+        inputs=[question, chatbot, db_state],
+        outputs=[chatbot, question]
+    )
+
+    clear_btn.click(
+        fn=clear_chat,
+        outputs=chatbot
     )
 
     demo.unload(cleanup_session)
 
 
-
 # ==========================================
-# 5. 서버 실행
+# 8. 서버 실행
 # ==========================================
 
 if __name__ == "__main__":
