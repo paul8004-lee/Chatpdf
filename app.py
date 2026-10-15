@@ -288,9 +288,14 @@ def answer(question, openai_key, db, history=None):
 
 
 
+
+
 # ===== Step 3. 화면 (feature/chat-ui) =====
 
 import os
+import base64
+import html
+import tempfile
 import threading
 from copy import deepcopy
 from pathlib import Path
@@ -300,10 +305,11 @@ from dotenv import load_dotenv
 
 
 # ==========================================
-# 1. 환경변수 및 세션 관리
+# 1. 환경변수 및 세션 설정
 # ==========================================
 
 load_dotenv()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 _session_dbs = {}
@@ -312,10 +318,35 @@ _sessions_guard = threading.Lock()
 
 
 # ==========================================
-# 2. CSS - 디자인 및 다크모드
+# 2. 팀 로고 불러오기
+# ==========================================
+
+def get_logo_html():
+    logo_path = Path(__file__).with_name("hyundap_logo.png")
+
+    if logo_path.exists():
+        encoded = base64.b64encode(
+            logo_path.read_bytes()
+        ).decode("utf-8")
+
+        return (
+            '<img class="team-logo" '
+            f'src="data:image/png;base64,{encoded}" '
+            'alt="hyundap 로고">'
+        )
+
+    return '<span class="logo-fallback">📚</span>'
+
+
+# ==========================================
+# 3. CSS - 라이트/다크모드
 # ==========================================
 
 CSS = """
+/* =========================
+   기본 색상
+========================= */
+
 .gradio-container {
     --page: #ffffff;
     --card: #ffffff;
@@ -324,28 +355,41 @@ CSS = """
     --fg: #202638;
     --muted: #738096;
     --line: #e3e8f1;
+    --chat-bg: #ffffff;
+    --assistant-bg: #ffffff;
 
     background: var(--page) !important;
     color: var(--fg) !important;
+
     max-width: 760px !important;
     min-height: 100vh;
+
     margin: auto !important;
     padding: 28px 18px !important;
-    font-family: 'Pretendard', Arial, sans-serif;
+
+    font-family:
+        'Pretendard',
+        'Inter',
+        Arial,
+        sans-serif;
 }
 
 html, body {
     background: #ffffff !important;
 }
 
-/* 다크모드 */
+/* =========================
+   다크모드
+========================= */
 
 html:has(#mode-select input[type="checkbox"]:checked),
 body:has(#mode-select input[type="checkbox"]:checked) {
     background: #11141c !important;
 }
 
-.gradio-container:has(#mode-select input[type="checkbox"]:checked) {
+.gradio-container:has(
+    #mode-select input[type="checkbox"]:checked
+) {
     --page: #11141c;
     --card: #1a1e2b;
     --field: #252b3a;
@@ -353,6 +397,9 @@ body:has(#mode-select input[type="checkbox"]:checked) {
     --fg: #f3f5fa;
     --muted: #acb5c8;
     --line: #394256;
+    --chat-bg: #1a1e2b;
+    --assistant-bg: #303749;
+
     color-scheme: dark;
 }
 
@@ -360,19 +407,27 @@ footer {
     display: none !important;
 }
 
-/* 메인 카드 */
+/* =========================
+   메인 카드
+========================= */
 
 #main-card {
     background: var(--card) !important;
     color: var(--fg) !important;
+
     border: 1px solid var(--line) !important;
     border-radius: 20px !important;
+
     padding: 22px !important;
     gap: 12px !important;
-    box-shadow: 0 10px 30px rgba(40,60,100,.05);
+
+    box-shadow:
+        0 10px 30px rgba(40, 60, 100, .05);
 }
 
-/* 제목 */
+/* =========================
+   상단 로고 + 제목
+========================= */
 
 #title-row {
     align-items: center !important;
@@ -380,18 +435,42 @@ footer {
     gap: 8px !important;
 }
 
+.brand-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.team-logo {
+    width: 36px;
+    height: 36px;
+    object-fit: contain;
+    border-radius: 5px;
+    flex-shrink: 0;
+}
+
+.logo-fallback {
+    font-size: 27px;
+}
+
 .page-title {
     font-size: 18px;
     font-weight: 800;
     color: var(--fg);
+    margin: 0;
+
     white-space: nowrap;
-    letter-spacing: -0.5px;
+    letter-spacing: -0.6px;
 }
+
+/* 다크모드 */
 
 #mode-select {
     background: transparent !important;
     border: none !important;
     padding: 0 !important;
+    min-width: 0 !important;
 }
 
 #mode-select label,
@@ -401,26 +480,35 @@ footer {
     white-space: nowrap !important;
 }
 
-/* 그라데이션 */
+/* =========================
+   그라데이션 구분선
+========================= */
 
 .gradient-line {
     width: 100%;
     height: 3px;
     border-radius: 99px;
+
     background: linear-gradient(
-        90deg, #329aff, #8578ff, #ff65af
+        90deg,
+        #329aff,
+        #8578ff,
+        #ff65af
     );
+
     margin: 4px 0 10px;
 }
 
 .section-label {
-    color: var(--fg);
     font-size: 14px;
     font-weight: 700;
+    color: var(--fg);
     margin-bottom: 5px;
 }
 
-/* PDF 업로드 */
+/* =========================
+   PDF 파일 업로드
+========================= */
 
 #file-row {
     align-items: stretch !important;
@@ -431,11 +519,13 @@ footer {
 #pdf-select {
     background: var(--field) !important;
     color: var(--fg) !important;
+
     border: 1px solid var(--line) !important;
     border-radius: 11px !important;
+
     min-height: 44px !important;
-    white-space: nowrap !important;
     font-size: 13px !important;
+    white-space: nowrap !important;
 }
 
 #pdf-select * {
@@ -445,14 +535,19 @@ footer {
 #upload-btn {
     background: var(--answer) !important;
     color: var(--fg) !important;
+
     border: 1px solid var(--line) !important;
     border-radius: 11px !important;
+
     min-height: 44px !important;
     min-width: 120px !important;
+
     font-size: 12px !important;
     font-weight: 700 !important;
     white-space: nowrap !important;
 }
+
+/* 업로드 상태 */
 
 #upload-status,
 #upload-status * {
@@ -460,39 +555,103 @@ footer {
     font-size: 12px !important;
 }
 
-/* 통합 채팅창 */
+/* =========================
+   PDF 목록
+========================= */
 
-#chat-panel {
+#document-accordion {
     background: var(--answer) !important;
     border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+}
+
+#document-accordion,
+#document-accordion * {
+    color: var(--fg) !important;
+}
+
+#document-list {
+    padding: 5px 8px !important;
+}
+
+#document-list,
+#document-list * {
+    color: var(--fg) !important;
+    font-size: 13px !important;
+    overflow-wrap: anywhere;
+}
+
+/* =========================
+   통합 채팅 카드
+========================= */
+
+#chat-panel {
+    background: var(--card) !important;
+
+    border: 1px solid var(--line) !important;
     border-radius: 16px !important;
+
     padding: 12px !important;
     gap: 10px !important;
 }
 
+.chat-heading {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--fg);
+}
+
+/* =========================
+   채팅창 라이트/다크 색상
+========================= */
+
 #chat-box {
-    background: transparent !important;
+    background: var(--chat-bg) !important;
     border: none !important;
     border-radius: 12px !important;
+
+    --background-fill-primary: var(--chat-bg);
+    --background-fill-secondary: var(--chat-bg);
+    --body-background-fill: var(--chat-bg);
+    --block-background-fill: var(--chat-bg);
+    --block-border-color: transparent;
+    --body-text-color: var(--fg);
+    --button-secondary-background-fill: var(--field);
+    --button-secondary-text-color: var(--fg);
 }
 
-#chat-box .message {
-    border-radius: 15px !important;
+#chat-box .bubble-wrap,
+#chat-box .message-wrap,
+#chat-box .chatbot,
+#chat-box .messages,
+#chat-box .scroll-hide,
+#chat-box .scrollable {
+    background: var(--chat-bg) !important;
 }
 
-#chat-box .message.user {
+/* 사용자 말풍선 */
+
+#chat-box .message.user,
+#chat-box .message.user.message {
     background: #6478ed !important;
-    color: white !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 16px !important;
 }
 
 #chat-box .message.user * {
-    color: white !important;
+    color: #ffffff !important;
 }
+
+/* AI 답변 말풍선 */
 
 #chat-box .message.bot,
 #chat-box .message.assistant {
-    background: var(--card) !important;
+    background: var(--assistant-bg) !important;
     color: var(--fg) !important;
+
+    border: 1px solid var(--line) !important;
+    border-radius: 16px !important;
 }
 
 #chat-box .message.bot *,
@@ -500,7 +659,9 @@ footer {
     color: var(--fg) !important;
 }
 
-/* 질문 입력창 */
+/* =========================
+   질문 입력창
+========================= */
 
 #input-row {
     align-items: stretch !important;
@@ -511,6 +672,7 @@ footer {
     background: var(--field) !important;
     border: 1px solid var(--line) !important;
     border-radius: 12px !important;
+
     padding: 0 !important;
     box-shadow: none !important;
     overflow: hidden !important;
@@ -519,9 +681,11 @@ footer {
 #question-box textarea {
     background: transparent !important;
     color: var(--fg) !important;
+
     border: none !important;
     outline: none !important;
     box-shadow: none !important;
+
     padding: 12px !important;
     font-size: 14px !important;
     min-height: 48px !important;
@@ -539,56 +703,61 @@ footer {
 
 #send-btn {
     background: linear-gradient(
-        135deg, #329aff, #827aff, #ff65af
+        135deg,
+        #329aff,
+        #827aff,
+        #ff65af
     ) !important;
-    color: white !important;
+
+    color: #ffffff !important;
     border: none !important;
     border-radius: 12px !important;
+
     min-height: 48px !important;
     font-size: 18px !important;
     font-weight: 800 !important;
 }
 
-/* ==========================================
+/* =========================
    대화 초기화 + 이전 기록
-========================================== */
+========================= */
 
 #history-row {
-    align-items: center !important;
+    align-items: stretch !important;
     flex-wrap: nowrap !important;
     gap: 10px !important;
 }
 
-/* 초기화 버튼 */
-
 #clear-btn {
     height: 48px !important;
     min-height: 48px !important;
-    border-radius: 12px !important;
+
     border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+
     background: var(--field) !important;
     color: var(--fg) !important;
+
     font-size: 13px !important;
     font-weight: 600 !important;
     white-space: nowrap !important;
     box-shadow: none !important;
 }
 
-/* 이전 기록 메뉴 */
-
 #history-menu {
     height: 48px !important;
     min-height: 48px !important;
+
     padding: 0 !important;
-    border: 1px solid var(--line) !important;
-    border-radius: 12px !important;
     background: var(--field) !important;
     color: var(--fg) !important;
+
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+
     box-shadow: none !important;
     overflow: hidden !important;
 }
-
-/* 드롭다운 내부 */
 
 #history-menu .wrap {
     height: 100% !important;
@@ -602,7 +771,6 @@ footer {
     background: transparent !important;
     color: var(--fg) !important;
     font-size: 13px !important;
-    font-weight: 600 !important;
 }
 
 #history-menu label,
@@ -611,11 +779,31 @@ footer {
     font-size: 13px !important;
 }
 
-#history-menu:focus-within {
-    border-color: #827aff !important;
+/* =========================
+   TXT 다운로드
+========================= */
+
+#download-btn {
+    min-height: 44px !important;
+
+    background: var(--field) !important;
+    color: var(--fg) !important;
+
+    border: 1px solid var(--line) !important;
+    border-radius: 12px !important;
+
+    font-size: 13px !important;
+    font-weight: 600 !important;
 }
 
-/* 모바일 */
+#download-file {
+    background: var(--answer) !important;
+    color: var(--fg) !important;
+}
+
+/* =========================
+   모바일 대응
+========================= */
 
 @media (max-width: 600px) {
     .gradio-container {
@@ -627,7 +815,12 @@ footer {
     }
 
     .page-title {
-        font-size: clamp(12px, 3.1vw, 17px);
+        font-size: clamp(12px, 3vw, 17px);
+    }
+
+    .team-logo {
+        width: 27px;
+        height: 27px;
     }
 
     #file-row,
@@ -654,7 +847,7 @@ footer {
 
 
 # ==========================================
-# 3. 세션 및 DB 관리
+# 4. DB 세션 관리
 # ==========================================
 
 def _session_lock(request):
@@ -671,12 +864,13 @@ def _delete_db(db):
 
     try:
         db.delete_collection()
+
     except Exception as e:
         print(f"[cleanup] DB 삭제 실패: {e}")
 
 
 # ==========================================
-# 4. 다중 PDF 업로드
+# 5. 다중 PDF 업로드
 # ==========================================
 
 def select_pdf(files):
@@ -691,20 +885,20 @@ def select_pdf(files):
         for f in files
     ]
 
-    names = [Path(p).name for p in paths]
-
-    status = (
-        f"✅ 총 {len(paths)}개 PDF 선택 완료\n\n"
-        + "\n".join(f"- 📄 {name}" for name in names)
+    return (
+        paths,
+        f"📎 PDF {len(paths)}개 선택 완료. 파일 등록을 눌러주세요."
     )
-
-    return paths, status
 
 
 def start_register(request: gr.Request):
+
     with _session_lock(request):
         _delete_db(
-            _session_dbs.pop(request.session_hash, None)
+            _session_dbs.pop(
+                request.session_hash,
+                None
+            )
         )
 
     locked = gr.update(interactive=False)
@@ -720,13 +914,21 @@ def start_register(request: gr.Request):
 
 
 def register_pdf(pdf_paths, request: gr.Request):
+
     if not pdf_paths:
         return None, "⚠️ PDF 파일을 선택해주세요."
 
     if not OPENAI_API_KEY:
-        return None, "⚠️ OPENAI_API_KEY 설정을 확인해주세요."
+        return (
+            None,
+            "⚠️ OPENAI_API_KEY 설정을 확인해주세요."
+        )
 
-    db, message = build_db(pdf_paths, OPENAI_API_KEY)
+    # Step 1의 기존 다중 PDF 처리 함수
+    db, message = build_db(
+        pdf_paths,
+        OPENAI_API_KEY
+    )
 
     if db is not None:
         with _session_lock(request):
@@ -735,22 +937,40 @@ def register_pdf(pdf_paths, request: gr.Request):
     return db, message
 
 
-def finish_register(db):
-    can_ask = gr.update(interactive=db is not None)
+def finish_register(db, pdf_paths):
+
+    success = db is not None
+    can_ask = gr.update(interactive=success)
+
+    if success and pdf_paths:
+        names = [
+            Path(path).name
+            for path in pdf_paths
+        ]
+
+        document_text = "\n".join(
+            f"- 📄 {name}"
+            for name in names
+        )
+
+    else:
+        document_text = "📁 등록된 문서가 없습니다."
 
     return (
         can_ask,
         can_ask,
         gr.update(interactive=True),
-        gr.update(interactive=True)
+        gr.update(interactive=True),
+        document_text
     )
 
 
 # ==========================================
-# 5. AI 질문 및 스트리밍 답변
+# 6. 질문 및 스트리밍 답변
 # ==========================================
 
 def ask_question(question, history, db, request: gr.Request):
+
     history = list(history or [])
     prior_history = deepcopy(history)
 
@@ -764,19 +984,23 @@ def ask_question(question, history, db, request: gr.Request):
 
     with _session_lock(request):
 
-        if db is None or db is not _session_dbs.get(
-            request.session_hash
+        if (
+            db is None
+            or db is not _session_dbs.get(
+                request.session_hash
+            )
         ):
             history.append({
                 "role": "assistant",
                 "content": "⚠️ 먼저 PDF 파일을 등록해주세요."
             })
+
             yield history, ""
             return
 
         history.append({
             "role": "assistant",
-            "content": "🤖 답변을 생성하는 중..."
+            "content": "답변을 생성하는 중..."
         })
 
         yield history, ""
@@ -792,6 +1016,7 @@ def ask_question(question, history, db, request: gr.Request):
             if isinstance(result, str):
                 history[-1]["content"] = result
                 yield history, ""
+
             else:
                 for text in result:
                     history[-1]["content"] = str(text)
@@ -808,15 +1033,17 @@ def ask_question(question, history, db, request: gr.Request):
 
 
 # ==========================================
-# 6. 이전 대화 기록 관리
+# 7. 이전 대화 기록
 # ==========================================
 
-# 기본 메뉴 항목
 HISTORY_DEFAULT = "__history_default__"
 
 
 def history_choices(archives):
-    choices = [("📜 이전 기록", HISTORY_DEFAULT)]
+
+    choices = [
+        ("📜 이전 기록", HISTORY_DEFAULT)
+    ]
 
     for item in reversed(archives or []):
         choices.append(
@@ -827,14 +1054,12 @@ def history_choices(archives):
 
 
 def archive_and_clear(history, archives):
-    """
-    현재 대화를 보관하고 채팅창을 초기화한다.
-    """
 
     archives = deepcopy(archives or [])
     history = deepcopy(history or [])
 
     if history:
+
         first_question = next(
             (
                 str(msg.get("content", ""))
@@ -844,7 +1069,9 @@ def archive_and_clear(history, archives):
             "이전 대화"
         )
 
-        title = first_question.replace("\n", " ").strip()
+        title = first_question.replace(
+            "\n", " "
+        ).strip()
 
         if len(title) > 24:
             title = title[:24] + "..."
@@ -877,14 +1104,12 @@ def archive_and_clear(history, archives):
 
 
 def restore_history(record_id, archives):
-    """
-    선택한 이전 기록을 현재 채팅창에 표시한다.
-    """
 
     if record_id == HISTORY_DEFAULT:
         return gr.skip(), ""
 
     for item in archives or []:
+
         if item["id"] == record_id:
             return deepcopy(item["messages"]), ""
 
@@ -892,24 +1117,81 @@ def restore_history(record_id, archives):
 
 
 # ==========================================
-# 7. 세션 종료
+# 8. TXT 대화 다운로드
+# ==========================================
+
+def create_chat_txt(history):
+
+    if not history:
+        raise gr.Error("다운로드할 대화가 없습니다.")
+
+    lines = [
+        "문서 질의응답 서비스 - 대화 기록",
+        "=" * 35,
+        ""
+    ]
+
+    for message in history:
+
+        role = message.get("role", "")
+
+        if role not in ("user", "assistant"):
+            continue
+
+        content = str(
+            message.get("content", "")
+        )
+
+        lines.append(
+            "[질문]" if role == "user"
+            else "[AI 답변]"
+        )
+
+        lines.append(content)
+        lines.append("")
+        lines.append("-" * 35)
+        lines.append("")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8-sig",
+        suffix=".txt",
+        prefix="chatpdf_",
+        delete=False
+    ) as file:
+
+        file.write("\n".join(lines))
+        return file.name
+
+
+# ==========================================
+# 9. 세션 정리
 # ==========================================
 
 def cleanup_session(request: gr.Request):
+
     with _session_lock(request):
         _delete_db(
-            _session_dbs.pop(request.session_hash, None)
+            _session_dbs.pop(
+                request.session_hash,
+                None
+            )
         )
 
     with _sessions_guard:
-        _session_locks.pop(request.session_hash, None)
+        _session_locks.pop(
+            request.session_hash,
+            None
+        )
 
 
 # ==========================================
-# 8. Gradio UI
+# 10. Gradio UI
 # ==========================================
 
-with gr.Blocks(title="문서 질의응답 서비스") as demo:
+with gr.Blocks(
+    title="문서 질의응답 서비스"
+) as demo:
 
     db_state = gr.State(value=None)
     selected_files = gr.State(value=None)
@@ -917,17 +1199,31 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
     with gr.Column(elem_id="main-card"):
 
-        # 제목 + 다크모드
+        # ==============================
+        # 상단 제목 + 팀 로고
+        # ==============================
+
         with gr.Row(elem_id="title-row"):
 
-            with gr.Column(scale=6, min_width=210):
-                gr.HTML("""
-                <div class="page-title">
-                    📚 문서 질의응답 서비스
+            with gr.Column(
+                scale=6,
+                min_width=210
+            ):
+
+                gr.HTML(f"""
+                <div class="brand-header">
+                    {get_logo_html()}
+                    <div class="page-title">
+                        문서 질의응답 서비스
+                    </div>
                 </div>
                 """)
 
-            with gr.Column(scale=1, min_width=100):
+            with gr.Column(
+                scale=1,
+                min_width=100
+            ):
+
                 dark_mode = gr.Checkbox(
                     label="🌙 다크모드",
                     value=False,
@@ -935,9 +1231,14 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
                     elem_id="mode-select"
                 )
 
-        gr.HTML('<div class="gradient-line"></div>')
+        gr.HTML(
+            '<div class="gradient-line"></div>'
+        )
 
-        # PDF 다중 업로드
+        # ==============================
+        # 다중 PDF 업로드
+        # ==============================
+
         gr.HTML(
             '<div class="section-label">'
             '📚 PDF 다중 문서 업로드'
@@ -970,30 +1271,46 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
             elem_id="upload-status"
         )
 
-        # 질문과 답변 통합
-        with gr.Column(elem_id="chat-panel"):
+        # PDF 목록
+        with gr.Accordion(
+            label="📄 등록된 PDF 목록",
+            open=False,
+            elem_id="document-accordion"
+        ):
 
-            gr.HTML(
-                '<div class="section-label">'
-                '💬 AI 대화'
-                '</div>'
+            document_list = gr.Markdown(
+                "등록된 문서가 없습니다.",
+                elem_id="document-list"
             )
 
+        # ==============================
+        # 통합 채팅창
+        # ==============================
+
+        with gr.Column(elem_id="chat-panel"):
+
+            gr.HTML("""
+            <div class="chat-heading">
+                💬 AI 대화
+            </div>
+            """)
+
             chatbot = gr.Chatbot(
-                placeholder=(
-                    "🤖 PDF를 등록한 뒤 "
-                    "궁금한 내용을 질문해 주세요."
-                ),
+                value=[],
                 show_label=False,
                 layout="bubble",
                 height=360,
+                buttons=["copy"],
                 elem_id="chat-box"
             )
 
+            # 하단 질문 입력
             with gr.Row(elem_id="input-row"):
 
                 question = gr.Textbox(
-                    placeholder="PDF에 대해 질문하세요...",
+                    placeholder=(
+                        "PDF에 대해 질문하세요..."
+                    ),
                     show_label=False,
                     container=False,
                     lines=1,
@@ -1013,9 +1330,9 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
                     elem_id="send-btn"
                 )
 
-        # ==================================
-        # 초기화 + 이전 기록 (같은 높이)
-        # ==================================
+        # ==============================
+        # 대화 초기화 + 이전 기록
+        # ==============================
 
         with gr.Row(elem_id="history-row"):
 
@@ -1029,7 +1346,10 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
 
             history_menu = gr.Dropdown(
                 choices=[
-                    ("📜 이전 기록", HISTORY_DEFAULT)
+                    (
+                        "📜 이전 기록",
+                        HISTORY_DEFAULT
+                    )
                 ],
                 value=HISTORY_DEFAULT,
                 show_label=False,
@@ -1040,18 +1360,38 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
                 elem_id="history-menu"
             )
 
+        # ==============================
+        # 대화 TXT 다운로드
+        # ==============================
+
+        download_btn = gr.Button(
+            "📥 현재 대화 TXT 다운로드",
+            variant="secondary",
+            elem_id="download-btn"
+        )
+
+        download_file = gr.File(
+            label="생성된 대화 파일",
+            interactive=False,
+            visible=False,
+            elem_id="download-file"
+        )
+
     # ======================================
-    # 9. 이벤트 연결
+    # 11. 이벤트 핸들러
     # ======================================
 
-    # PDF 선택
+    # 다중 PDF 선택
     pdf_file.upload(
         fn=select_pdf,
         inputs=[pdf_file],
-        outputs=[selected_files, status]
+        outputs=[
+            selected_files,
+            status
+        ]
     )
 
-    # PDF 등록
+    # PDF 처리 시작
     upload_btn.click(
         fn=start_register,
         outputs=[
@@ -1065,35 +1405,60 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
     ).then(
         fn=register_pdf,
         inputs=[selected_files],
-        outputs=[db_state, status]
+        outputs=[
+            db_state,
+            status
+        ]
     ).then(
         fn=finish_register,
-        inputs=[db_state],
+        inputs=[
+            db_state,
+            selected_files
+        ],
         outputs=[
             question,
             send_btn,
             pdf_file,
-            upload_btn
+            upload_btn,
+            document_list
         ]
     )
 
-    # 질문 전송
+    # 질문하기
     send_btn.click(
         fn=ask_question,
-        inputs=[question, chatbot, db_state],
-        outputs=[chatbot, question]
+        inputs=[
+            question,
+            chatbot,
+            db_state
+        ],
+        outputs=[
+            chatbot,
+            question
+        ]
     )
 
+    # Enter 전송
     question.submit(
         fn=ask_question,
-        inputs=[question, chatbot, db_state],
-        outputs=[chatbot, question]
+        inputs=[
+            question,
+            chatbot,
+            db_state
+        ],
+        outputs=[
+            chatbot,
+            question
+        ]
     )
 
-    # 대화 보관 후 초기화
+    # 이전 대화 보관 및 초기화
     clear_btn.click(
         fn=archive_and_clear,
-        inputs=[chatbot, archived_chats],
+        inputs=[
+            chatbot,
+            archived_chats
+        ],
         outputs=[
             chatbot,
             question,
@@ -1102,22 +1467,39 @@ with gr.Blocks(title="문서 질의응답 서비스") as demo:
         ]
     )
 
-    # 이전 기록 불러오기
+    # 이전 대화 불러오기
     history_menu.change(
         fn=restore_history,
-        inputs=[history_menu, archived_chats],
-        outputs=[chatbot, question]
+        inputs=[
+            history_menu,
+            archived_chats
+        ],
+        outputs=[
+            chatbot,
+            question
+        ]
     )
 
-    # 세션 종료 시 DB 정리
+    # 현재 대화 TXT 파일 생성
+    download_btn.click(
+        fn=create_chat_txt,
+        inputs=[chatbot],
+        outputs=[download_file]
+    ).then(
+        fn=lambda: gr.update(visible=True),
+        outputs=[download_file]
+    )
+
+    # 세션 종료
     demo.unload(cleanup_session)
 
 
 # ==========================================
-# 10. 서버 실행
+# 12. 서버 실행
 # ==========================================
 
 if __name__ == "__main__":
+
     demo.launch(
         css=CSS,
         theme=gr.themes.Soft()
