@@ -1,5 +1,7 @@
 """Run: .venv/Scripts/python.exe -m unittest test_app -v (no API calls)."""
 import base64
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +11,7 @@ from langchain_core.embeddings import Embeddings
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 import app
+import request_log
 
 
 class LocalEmbeddings(Embeddings):
@@ -177,6 +180,88 @@ class VisualChunkFallbackTest(unittest.TestCase):
             self.assertIn("1개 파일 · 2페이지 · 2개 청크", message)
             self.assertIn("vision failed", "\n".join(logs.output))
             db.delete_collection()
+
+
+def noise_png(width, height, seed):
+    """압축이 안 되는 무작위 픽셀 PNG (내용 있는 이미지 흉내)"""
+    import random
+    data = random.Random(seed).randbytes(width * height * 3)
+    return app.fitz.Pixmap(app.fitz.csRGB, width, height, data, False).tobytes("png")
+
+
+@unittest.skipIf(app.fitz is None, "pymupdf 필요")
+class VisualChunkBoundTest(unittest.TestCase):
+    """#74: 시각 청킹은 호출 상한·중복/장식 제외·병렬 호출, 이미지 파일을 남기지 않음 (API 호출 없음)"""
+
+    def write(self, folder, pages):
+        path = Path(folder) / "visual.pdf"
+        doc = app.fitz.open()
+        for images in pages:
+            page = doc.new_page(width=600, height=800)
+            for index, image in enumerate(images):
+                page.insert_image(app.fitz.Rect(10, 10 + index * 150, 210, 150 + index * 150), stream=image)
+        doc.save(path)
+        doc.close()
+        return path
+
+    def extract(self, path, side_effect=None):
+        chunker = app.VisualElementChunker(api_key="test")
+        labels = {}
+        def summarize(image_bytes, ext="png", config=None):
+            return labels.setdefault(image_bytes, f"img{len(labels)}")
+        with patch.object(chunker, "_summarize_image", side_effect=side_effect or summarize) as image, \
+             patch.object(chunker, "_summarize_table") as table:
+            chunks = chunker.extract_visual_chunks(str(path), "visual.pdf")
+        table.assert_not_called()
+        return chunks, image
+
+    def test_duplicate_and_decorative_images_are_skipped_without_files(self):
+        chart, other = noise_png(200, 200, 1), noise_png(200, 200, 2)
+        bar, icon = noise_png(1000, 120, 3), noise_png(60, 60, 4)
+        blank = app.fitz.Pixmap(app.fitz.csRGB, app.fitz.IRect(0, 0, 400, 400), False)
+        blank.clear_with(255)   # 크지만 단색인 배경 장식
+        blank = blank.tobytes("png")
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.write(folder, [[chart, bar, icon, blank], [chart, other]])
+            cwd = Path.cwd()
+            os.chdir(folder)
+            try:
+                chunks, image = self.extract(path)
+                leftovers = sorted(p.name for p in Path(folder).iterdir())
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(image.call_count, 2)   # chart 1번(2쪽 반복 제외) + other
+        self.assertEqual([c.metadata["page"] for c in chunks], [0, 1])
+        self.assertEqual(leftovers, ["visual.pdf"])   # extracted_images 폴더가 생기지 않음
+
+    def test_cap_keeps_page_order_and_failure_is_isolated(self):
+        images = [noise_png(200, 200, seed) for seed in range(5)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.write(folder, [[image] for image in images])
+            with patch.object(app, "MAX_VISION_CALLS", 3):
+                chunks, image = self.extract(path)
+            self.assertEqual(image.call_count, 3)
+            self.assertEqual([c.metadata["page"] for c in chunks], [0, 1, 2])
+
+            def flaky(image_bytes, ext="png", config=None):
+                if image_bytes == images[1]:
+                    raise RuntimeError("vision failed")
+                return "ok"
+            with self.assertLogs("app", level="WARNING") as logs:
+                chunks, _ = self.extract(path, side_effect=flaky)
+        self.assertEqual([c.metadata["page"] for c in chunks], [0, 2, 3, 4])
+        self.assertIn("vision failed", "\n".join(logs.output))
+
+    def test_counts_are_written_to_request_log(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.write(folder, [[noise_png(200, 200, 1)], [noise_png(200, 200, 1)]])
+            log = Path(folder) / "log.jsonl"
+            with request_log.request(log, "pdf_processing"):
+                self.extract(path)
+            events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        visual = next(e for e in events if e["event"] == "visual_chunks")
+        self.assertEqual((visual["vision_calls"], visual["images"], visual["skipped_duplicate"]), (1, 1, 1))
+        self.assertIn("seconds", visual)
 
 
 class SourceFormatTest(unittest.TestCase):

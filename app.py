@@ -1,6 +1,9 @@
 # ===== Step 1. PDF 처리 (feature/pdf-processing) =====
+import hashlib
 import logging
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -10,7 +13,6 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 import request_log
 import base64
-import os
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
@@ -24,25 +26,32 @@ except ImportError:
 
 NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
 
+# 시각 청킹 비용·시간 상한 (#74)
+# - 35쪽 PDF에서 표·이미지마다 순서대로 호출해 등록이 145초 걸렸음 → 상한·중복 제거·병렬 호출
+MAX_VISION_CALLS = 20        # PDF 하나당 GPT 호출(이미지 분석·표 요약) 최대 횟수. 넘는 요소는 건너뜀
+VISION_MAX_WORKERS = 4       # 동시에 보내는 호출 수(속도 제한에 걸리지 않을 정도로 작게)
+MIN_IMAGE_SIDE = 120         # 가로·세로가 이보다 작은 이미지는 아이콘·로고로 보고 제외
+MIN_IMAGE_BYTES = 4096       # 파일이 이보다 작은 큰 이미지는 단색 띠·배경 장식(실측 650~1,900바이트)으로 보고 제외
+MAX_IMAGE_ASPECT = 5         # 가로:세로(또는 세로:가로)가 이보다 길쭉하면 구분선·띠 장식으로 보고 제외
+# 표는 to_markdown 원문이 이미 수치를 그대로 담고, 같은 내용이 텍스트 청크·페이지 원문(#37)에도 있어
+# GPT 요약은 기본으로 끔. 켜면 표 요약도 MAX_VISION_CALLS 안에서 함께 처리됨
+SUMMARIZE_TABLES = False
+
+
 # ==========================================
 # 표 / 이미지 전담 청킹 클래스 정의
 # ==========================================
 class VisualElementChunker:
     """PDF 내에서 일반 텍스트는 건너뛰고, '표(Table)'와 '이미지/차트(Image)'만 전담으로 추출 및 요약 청킹"""
 
-    def __init__(
-        self,
-        api_key: str,
-        model_name: str = "gpt-4o-mini",
-        image_save_dir: str = "./extracted_images",
-    ):
+    def __init__(self, api_key: str, model_name: str = "gpt-4o-mini"):
+        self.model_name = model_name
         self.llm = ChatOpenAI(model=model_name, temperature=0.0, api_key=api_key)
-        self.image_save_dir = image_save_dir
-        os.makedirs(self.image_save_dir, exist_ok=True)
 
-    def _summarize_image(self, image_path: str) -> str:
-        with open(image_path, "rb") as f:
-            b64_image = base64.b64encode(f.read()).decode("utf-8")
+    def _summarize_image(self, image_bytes: bytes, ext: str = "png", config=None) -> str:
+        # 이미지는 파일로 저장하지 않고 메모리에서 바로 보냄 (#74: ./extracted_images가 계속 쌓이던 문제)
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        mime = "jpeg" if ext in ("jpg", "jpeg") else ext
 
         prompt = """
         당신은 데이터 시각화 및 문서 분석 전문가입니다.
@@ -57,14 +66,14 @@ class VisualElementChunker:
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64_image}"},
+                    "image_url": {"url": f"data:image/{mime};base64,{b64_image}"},
                 },
             ]
         )
-        response = self.llm.invoke([message])
+        response = self.llm.invoke([message], config=config)
         return response.content
 
-    def _summarize_table(self, table_markdown: str) -> str:
+    def _summarize_table(self, table_markdown: str, config=None) -> str:
         prompt = f"""
         다음 표의 구조와 수치 데이터를 분석하여 핵심 요약문을 작성하세요.
         사용자가 자연어로 검색할 때 이 표가 잘 검색될 수 있도록 주요 항목명, 수치, 결론을 포함하세요.
@@ -72,70 +81,125 @@ class VisualElementChunker:
         [표 데이터]
         {table_markdown}
         """
-        response = self.llm.invoke(prompt)
+        response = self.llm.invoke(prompt, config=config)
         return response.content
 
+    @staticmethod
+    def _is_decorative(base_image) -> bool:
+        """아이콘·로고·구분선·단색 배경처럼 내용이 없는 이미지인지 (#74)"""
+        width, height = base_image["width"], base_image["height"]
+        if width < MIN_IMAGE_SIDE or height < MIN_IMAGE_SIDE:
+            return True
+        if len(base_image["image"]) < MIN_IMAGE_BYTES:
+            return True
+        return max(width, height) / min(width, height) > MAX_IMAGE_ASPECT
+
     def extract_visual_chunks(self, pdf_path: str, filename: str) -> list[Document]:
+        started = time.perf_counter()
+        stats = dict(tables=0, images=0, vision_calls=0, skipped_decorative=0,
+                     skipped_duplicate=0, skipped_cap=0, failed=0)
+        # 페이지 순서대로 만들 청크 목록: (GPT 호출 종류 "image"·"table" 또는 호출 없음 None, 입력, 메타데이터)
+        jobs = []
+        seen_xrefs, seen_hashes = set(), set()
         doc = fitz.open(pdf_path)
+        try:
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
+                page_num = page_idx  # 0-based page index
+
+                # 1. 표(Table) 추출
+                tabs = page.find_tables()
+                for t_idx, table in enumerate(tabs):
+                    df = table.to_pandas()
+                    if df.empty or df.shape[0] < 1:
+                        continue
+                    table_md = df.to_markdown(index=False)
+                    metadata = {
+                        "element_type": "table",
+                        "page": page_num,
+                        "source_filename": filename,
+                        "source": str(pdf_path),
+                        "table_index": t_idx,
+                        "raw_table_md": table_md,
+                    }
+                    stats["tables"] += 1
+                    jobs.append(("table" if SUMMARIZE_TABLES else None, table_md, metadata))
+
+                # 2. 이미지/차트(Image) 추출. 같은 이미지(xref·내용)가 여러 페이지에 반복되면 한 번만 (#74)
+                for img_idx, img_info in enumerate(page.get_images(full=True)):
+                    xref = img_info[0]
+                    if xref in seen_xrefs:
+                        stats["skipped_duplicate"] += 1
+                        continue
+                    seen_xrefs.add(xref)
+                    base_image = doc.extract_image(xref)
+                    if self._is_decorative(base_image):
+                        stats["skipped_decorative"] += 1
+                        continue
+                    digest = hashlib.sha1(base_image["image"]).hexdigest()
+                    if digest in seen_hashes:
+                        stats["skipped_duplicate"] += 1
+                        continue
+                    seen_hashes.add(digest)
+                    metadata = {
+                        "element_type": "image",
+                        "page": page_num,
+                        "source_filename": filename,
+                        "source": str(pdf_path),
+                        "image_index": img_idx,
+                        "image_xref": xref,
+                    }
+                    jobs.append(("image", (base_image["image"], base_image["ext"]), metadata))
+        finally:
+            doc.close()
+
+        # PDF당 호출 상한: 페이지 앞쪽부터 상한까지만 호출하고 나머지 이미지는 청크를 만들지 않음 (#74)
+        calls = 0
+        kept = []
+        for job in jobs:
+            if job[0] is not None:
+                if calls >= MAX_VISION_CALLS:
+                    if job[0] == "image":
+                        stats["skipped_cap"] += 1
+                        continue
+                    job = (None,) + job[1:]  # 상한을 넘은 표는 요약 없이 원문만 둠
+                else:
+                    calls += 1
+            kept.append(job)
+
+        # 호출은 몇 개씩 동시에 보내고, 결과는 원래 순서대로 모음. 하나가 실패해도 나머지는 등록 (#74, #65)
+        trace = request_log.current()   # 작업 스레드에는 요청 로그 컨텍스트가 넘어가지 않아 미리 잡아 둠
+        config = {"callbacks": [request_log.TokenUsageCallback(trace, self.model_name)]} if trace else None
+
+        def run(job):
+            """(청크 내용, 실패 여부). 표는 요약이 실패해도 원문은 남기고, 이미지는 건너뜀"""
+            kind, payload, metadata = job
+            try:
+                if kind == "image":
+                    return f"[이미지/차트 분석]\n{self._summarize_image(*payload, config=config)}", False
+                if kind == "table":
+                    return f"[표 데이터 요약]\n{self._summarize_table(payload, config=config)}\n\n[원본 표]\n{payload}", False
+            except Exception as error:
+                logging.getLogger(__name__).warning("시각 요소 분석 실패(%s p.%s): %s",
+                                                    filename, metadata["page"] + 1, error)
+                return (None if kind == "image" else f"[원본 표]\n{payload}"), True
+            return f"[원본 표]\n{payload}", False
+
+        with ThreadPoolExecutor(max_workers=VISION_MAX_WORKERS) as pool:
+            results = list(pool.map(run, kept))
+
         visual_chunks: list[Document] = []
+        for (kind, _, metadata), (content, failed) in zip(kept, results):
+            stats["vision_calls"] += kind is not None
+            stats["failed"] += failed
+            if content is None:
+                continue
+            stats["images"] += metadata["element_type"] == "image"
+            visual_chunks.append(Document(page_content=content, metadata=metadata))
 
-        for page_idx in range(len(doc)):
-            page = doc[page_idx]
-            page_num = page_idx  # 0-based page index
-
-            # 1. 표(Table) 추출
-            tabs = page.find_tables()
-            for t_idx, table in enumerate(tabs):
-                df = table.to_pandas()
-                if df.empty or df.shape[0] < 1:
-                    continue
-
-                table_md = df.to_markdown(index=False)
-                table_summary = self._summarize_table(table_md)
-
-                visual_chunks.append(
-                    Document(
-                        page_content=f"[표 데이터 요약]\n{table_summary}\n\n[원본 표]\n{table_md}",
-                        metadata={
-                            "element_type": "table",
-                            "page": page_num,
-                            "source_filename": filename,
-                            "source": str(pdf_path),
-                            "table_index": t_idx,
-                            "raw_table_md": table_md,
-                        },
-                    )
-                )
-
-            # 2. 이미지/차트(Image) 추출
-            image_list = page.get_images(full=True)
-            for img_idx, img_info in enumerate(image_list):
-                xref = img_info[0]
-                base_image = doc.extract_image(xref)
-                if base_image["width"] < 120 or base_image["height"] < 120:
-                    continue
-
-                img_filename = f"page_{page_num + 1}_img_{img_idx}_{uuid.uuid4().hex[:6]}.{base_image['ext']}"
-                img_filepath = os.path.join(self.image_save_dir, img_filename)
-                with open(img_filepath, "wb") as f:
-                    f.write(base_image["image"])
-
-                img_summary = self._summarize_image(img_filepath)
-
-                visual_chunks.append(
-                    Document(
-                        page_content=f"[이미지/차트 분석]\n{img_summary}",
-                        metadata={
-                            "element_type": "image",
-                            "page": page_num,
-                            "source_filename": filename,
-                            "source": str(pdf_path),
-                            "image_path": img_filepath,
-                        },
-                    )
-                )
-
-        doc.close()
+        if trace:
+            trace.emit("visual_chunks", filename=filename, chunks=len(visual_chunks),
+                       seconds=round(time.perf_counter() - started, 4), **stats)
         return visual_chunks
 
 def _layout_page_texts(pdf_path, pages):
@@ -210,7 +274,9 @@ def _build_db(pdf_paths, openai_key):
                 visual_chunks = []
                 if visual_chunker is not None:
                     try:
-                        visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
+                        # 시각 청킹 시간·호출 수·토큰을 요청 로그에 따로 남김 (#74)
+                        with request_log.stage("visual_chunking"):
+                            visual_chunks = visual_chunker.extract_visual_chunks(str(pdf_path), filename)
                     except Exception as ve:
                         logging.getLogger(__name__).warning("시각 청크 추출 실패(%s): %s", filename, ve)
 
