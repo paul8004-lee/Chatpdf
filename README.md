@@ -13,12 +13,18 @@ pinned: false
 현대경제연구원 pdf 문서 기반 Q&A 챗봇
 
 ## 팀원과 역할
-| 이름 | 역할 | 담당 브랜치 |
+GitHub PR 작성 기록 기준으로 정리했습니다. 공식 역할명은 팀 확인 후 보완합니다.
+
+| 이름 (GitHub) | 담당 (PR 기록 기준) | 담당 브랜치 |
 |---|---|---|
-|  | PM / 팀장 |  |
-|  |  | feature/pdf-processing |
-|  |  | feature/qa-chain |
-|  |  | feature/chat-ui |
+| 이성민 (paul8004-lee) | 팀장, 통합·버그 수정 | `bugfix`, `fix/*` |
+| 이준영 (wljycjdi2001-ljy) | Step 1 PDF 처리, 청크 튜닝, 표·이미지 청킹 | `feature/step1_answer`, `feature/STEP1_answer_JY` |
+| TODO 이름 확인 (wjsworud1025) | Step 1 다중 PDF 처리, 요청 로그(#49), DB 정리(#25) | `feat]여러_PDF_업로드_및_통합_검색지원_#8`, `feature/logging_#49` |
+| 소용우 (nasaro-pro) | Step 2 재정렬·캐시·성능 기록, 검색 방식 선택 | `feature/step2_answer-nasaro`, `feature/step2_answer` |
+| 박영준 (joon0724) | Step 2 답변 기능, 근거 원문 표시 | `feature/step2_answer_joon` |
+| 박경환 (qkrrud141) | Step 3 Gradio 화면, 다중 PDF 업로드 화면 | `feature/chat-ui`, `featurechatui` |
+| 기메리 (doxoba) | Step 3 대화 기록 유지·이전 대화 기록 화면 | `feature/chat_ui/HYEL` |
+| TODO (teamone-kim) | TODO: PR 기록 없음, 담당 확인 필요 | TODO |
 
 ## 실행 방법
 ```bash
@@ -76,6 +82,29 @@ python app.py
 4. 검색 결과의 `source_filename`과 `page + 1`을 화면에 표시합니다.
 
 검증: `python -m unittest test_app -v`. 실제 PDF와 Chroma를 사용하고, 임베딩만 로컬 대체값을 사용합니다. 다중 PDF 검색·메타데이터·단일 PDF·새 컬렉션 격리·손상된 PDF·텍스트 없는 PDF·임베딩 실패를 검증합니다. 실제 OpenAI API 및 화면 연동 검증은 별도입니다.
+
+## Step 2 질문 처리: 검색 방식·근거 원문·캐시
+
+- **검색 방식 선택**: `app.py`의 `SEARCH_MODE` 한 줄로 바꿉니다. `similarity`(가장 비슷한 조각), `mmr`(비슷하되 겹치지 않는 조각), `multiquery`(질문을 3개로 바꿔 MMR 검색, GPT 1회 추가), `multiquery_rerank`(multiquery + GPT 재정렬, GPT 2회 추가, **기본값**). `answer()`와 비교 실험이 같은 `_retrieve()`를 씁니다. 여러 PDF를 등록하면 방식과 관계없이 파일별 후보를 추가하고 빠진 파일을 보충합니다(#59). 재정렬이 실패하면 원래 순서로 답변을 이어가고 `rerank_fallback`을 기록합니다.
+- **근거 원문**: 답변 아래 `참고: 파일명 (p.N)` 다음에 `근거 원문`을 최대 3개 표시합니다. 예: `> [보고서.pdf p.3] "2026년 경제성장률은 …"`. 검색이 고른 조각에서 질문 단어가 가장 많이 든 문장 1~2개(최대 150자)를 고르며, GPT를 추가로 호출하지 않습니다. 페이지 번호는 `참고`와 같은 실제 PDF 페이지(`page + 1`, #28)입니다.
+- **답변 캐시**: 같은 PDF 묶음(Chroma 컬렉션 이름 기준, #24)에 같은 질문을 하면 저장된 답변(근거 원문 포함)을 바로 보여줍니다. 최대 100개까지 보관하며, PDF를 교체하면 이전 DB의 캐시를 지웁니다. DB 객체가 사라질 때도 다음 캐시 사용 시 자동으로 정리합니다.
+- **기록**: `eval/qa_log.jsonl`의 `qa_result` 이벤트에 `mode`(검색 방식)와 `rerank_ok`(재정렬 성공 여부, 재정렬을 안 하는 방식이면 `null`)를 남깁니다.
+
+### 검색 방식 비교 (`eval/compare_retrievers.py`)
+
+`python eval/compare_retrievers.py samples/test.pdf` 실행 결과입니다. 검색만 실행하고 답변은 만들지 않습니다. 정답 페이지가 있는 `eval/qa_set.jsonl` 질문 5개 중 하나라도 정답 페이지를 찾은 비율을 적중률로 셉니다. 텍스트 청크만 사용했고, 2회 실행 결과입니다(`eval/results_retriever.csv`는 2회차).
+
+| 검색 방식 | k=3 적중률 | k=4 적중률 | k=6 적중률 | 평균 시간 (k=4) |
+|---|:---:|:---:|:---:|:---:|
+| similarity | 60% / 60% | 60% / 60% | 100% / 100% | 0.2초 |
+| mmr | 80% / 80% | 80% / 80% | 80% / 80% | 0.2초 |
+| multiquery | 60% / 60% | 60% / 60% | 80% / 80% | 1.8~2.1초 |
+| **multiquery_rerank (기본, k=4)** | 60% / 80% | **80% / 80%** | 80% / 80% | 2.8초 |
+
+- 질문이 5개라 1문항이 20%p입니다. 방식 간 차이는 대부분 1문항 이내라 이 표만으로 우열을 정하기 어렵습니다.
+- `similarity k=6`이 가장 높지만, k를 늘리면 GPT에 넘기는 페이지가 늘어 토큰·응답 시간이 커집니다. 답변 품질 평가(#37·#59 질문 47개)는 `multiquery_rerank`, `TOP_K=4` 기준으로 맞춰져 있어 기본값을 유지합니다. 바꾸려면 질문을 늘려 비교한 뒤 `eval/eval_issue37.py`로 답변 품질도 함께 확인해야 합니다.
+
+검증: `python -m unittest test_step2_search -v` (외부 API 호출 없음). 검색 방식 4개, 재정렬 실패 기록, 캐시 키·PDF 교체 시 캐시 분리, 근거 원문 형식을 확인합니다.
 
 ## 요청별 누적 로그 (#49)
 
