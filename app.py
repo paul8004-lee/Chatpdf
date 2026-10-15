@@ -4,12 +4,27 @@ import uuid
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
+from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 import request_log
 
 NO_TEXT_ERROR = "검색 가능한 텍스트가 없습니다."
+
+
+def _layout_page_texts(pdf_path, pages):
+    """페이지별 레이아웃 보존 텍스트 {page: text}. 표의 열(대상·연도) 배치가 글자 위치로 남아
+    여러 열짜리 표를 GPT가 열별로 읽을 수 있게 함 (#37). 실패하면 일반 추출 텍스트를 사용."""
+    try:
+        reader = PdfReader(str(pdf_path))
+        texts = {}
+        for index, page in enumerate(reader.pages):
+            lines = (line.rstrip() for line in page.extract_text(extraction_mode="layout").splitlines())
+            texts[index] = "\n".join(line for line in lines if line.strip())
+        return texts
+    except Exception:
+        return {page.metadata.get("page"): page.page_content for page in pages}
 
 
 def _load_failure_reason(error):
@@ -61,8 +76,11 @@ def _build_db(pdf_paths, openai_key):
                 chunks = splitter.split_documents(pages)
                 if not chunks:
                     raise ValueError(NO_TEXT_ERROR)
+                page_texts = _layout_page_texts(pdf_path, pages)
                 for chunk in chunks:
                     chunk.metadata["chunk_id"] = uuid.uuid4().hex
+                    # 답변할 때 이 조각이 속한 페이지 전체(표의 열 배치 유지)를 근거로 쓰기 위해 저장 (#37)
+                    chunk.metadata["page_text"] = page_texts.get(chunk.metadata.get("page"), "")
                 request_log.current().emit("pdf_loaded", filename=filename,
                                            pages=len(pages), chunks=len(chunks))
         except Exception as error:
@@ -116,6 +134,7 @@ import gradio as gr              # 웹 화면 라이브러리. 여기서는 gr.E
 import openai                    # OpenAI 공식 라이브러리. API 키 오류 등 '오류 종류'를 구분하는 데 사용
 from langchain.retrievers.document_compressors import LLMListwiseRerank  # GPT가 검색 결과의 순위를 다시 매겨주는 도구
 from langchain.retrievers.multi_query import MultiQueryRetriever         # 질문 하나를 여러 표현으로 바꿔 여러 번 검색하는 도구
+from langchain_core.documents import Document                                     # 페이지 단위로 이어 붙인 근거를 담는 문서 객체
 from langchain_core.output_parsers import StrOutputParser                        # GPT 응답 객체에서 '글자(문자열)'만 꺼내주는 도구
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate            # GPT에게 보낼 지시문(프롬프트) 틀을 만드는 도구
 from langchain_openai import ChatOpenAI                                          # LangChain에서 GPT 모델을 부르는 도구
@@ -123,6 +142,7 @@ from langchain_openai import ChatOpenAI                                         
 # ---------- 설정값 (숫자만 바꾸면 동작이 바뀜) ----------
 MODEL_NAME = "gpt-4o-mini"       # 사용할 GPT 모델 이름
 TOP_K = 4                        # 최종적으로 GPT에게 넘겨줄 PDF 조각 개수
+MAX_CONTEXT_CHARS = 10000        # 페이지 단위로 넓힌 근거 글자 수 상한 (비용·속도 보호)
 MAX_QUESTION_LEN = 500           # 질문 최대 글자 수 (너무 긴 질문은 비용이 커서 막음)
 MAX_HISTORY_TURNS = 3            # 후속 질문을 이해하려고 참고할 '최근 대화' 개수 (질문+답변 한 쌍이 1개)
 CACHE_SIZE = 100                 # 답변 캐시(임시 저장소)에 보관할 최대 질문 수
@@ -159,7 +179,15 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
      "1. 아래 [문서] 내용만 근거로 한국어로 답하세요.\n"                            # 근거 제한
      "2. 문서에 없는 내용은 추측하지 말고 '문서에서 확인할 수 없습니다'라고 답하세요.\n"  # 모르면 모른다고
      "3. 수치는 문서 표현 그대로 쓰고, 근거 문장 끝에 (p.페이지) 형식으로 표시하세요.\n"  # 출처 표시
-     "4. 핵심부터 간결하게 답하세요.\n\n"                                         # 답변 스타일
+     "4. 핵심부터 간결하게 답하세요.\n"                                           # 답변 스타일
+     "5. 표: 행(항목)과 열(연도·기간)을 맞춰 읽고, 비교·증감 질문은 해당 수치를 직접 비교해 답하세요. "
+     "표에 필요한 수치가 있으면 '확인할 수 없다'고 하지 마세요. 일부만 확인되면 확인되는 부분은 답하고 "
+     "확인되지 않는 부분만 그렇다고 밝히세요.\n"                                    # 표 비교 (#37)
+     "6. 목록: '모두', '구성', '3대', 'N개'처럼 전체를 묻거나 문서가 개수를 제시하면 문서의 항목을 하나도 빠뜨리지 말고 "
+     "원문 명칭 그대로 나열하세요. 문서에 없는 항목은 만들지 마세요.\n"               # 목록 완전성 (#37)
+     "7. 공통점: 여러 대상의 '공통' 특징을 물으면 모든 대상에 실제로 나타나는 것만 공통이라고 하세요. "
+     "일부 대상에만 해당하면 대상별로 구분해 쓰고, 공통 요소가 없으면 없다고 답하세요.\n"  # 잘못된 일반화 방지 (#37)
+     "8. 표가 글자로 풀려 열(대상) 구분이 불분명하면 단정하지 말고 그 한계를 밝히세요.\n\n"
      "[문서]\n{context}"),                                                        # {context}에 검색된 PDF 내용이 들어감
     ("human", "{question}"),                                                      # {question}에 사용자 질문이 들어감
 ])
@@ -248,6 +276,26 @@ def _log(**record):
     trace = request_log.current()
     if trace:
         trace.emit("qa_result", **record)
+
+
+def _expand_to_pages(docs):
+    """[#37] 고른 조각을 그 조각이 속한 페이지 전체(레이아웃 보존 텍스트)로 바꿈.
+    표·목록이 600자 청크 경계에서 잘려 일부만 GPT에 전달되는 문제를 막음.
+    같은 페이지는 한 번만 넣고, 재정렬 순서를 유지하며, 전체 글자 수는 MAX_CONTEXT_CHARS를 넘지 않게 함."""
+    expanded, seen, total = [], set(), 0
+    for doc in docs:
+        key = (_source_name(doc.metadata), doc.metadata.get("page"))
+        if key in seen:
+            continue
+        seen.add(key)
+        page_text = doc.metadata.get("page_text") or doc.page_content   # 예전 DB처럼 page_text가 없으면 조각 그대로
+        if expanded and total + len(page_text) > MAX_CONTEXT_CHARS:
+            page_text = doc.page_content                                 # 상한을 넘으면 그 페이지는 원래 조각만
+            if total + len(page_text) > MAX_CONTEXT_CHARS:
+                break
+        expanded.append(Document(page_content=page_text, metadata=doc.metadata))
+        total += len(page_text)
+    return expanded
 
 
 def _log_documents(db, docs):
@@ -350,6 +398,11 @@ def _answer(question, openai_key, db, history=None):
         docs = _rerank(llm, docs, search_question)              # [업그레이드 1] 8개 중 가장 관련 있는 4개로 추림
         with request_log.stage("selected_context"):
             _log_documents(db, docs)
+        with request_log.stage("page_context"):                 # [#37] 고른 조각을 페이지 전체로 넓힘
+            docs = _expand_to_pages(docs)
+            if trace:
+                trace.emit("page_context", pages=[_page_label(d.metadata) for d in docs],
+                           chars=sum(len(d.page_content) for d in docs))
 
         if not docs:                                            # 관련 내용을 하나도 못 찾았으면
             trace.status = "no_results"

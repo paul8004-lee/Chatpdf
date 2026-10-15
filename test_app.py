@@ -204,6 +204,47 @@ class PdfSelectionTest(unittest.TestCase):
         self.assertIn("선택한 PDF가 없습니다", status)
 
 
+class PageContextTest(unittest.TestCase):
+    """#37: 고른 조각을 그 페이지 전체(레이아웃 보존 텍스트)로 넓혀 표·목록이 잘리지 않게 함"""
+
+    def doc(self, text, page_text=None, name="a.pdf", page=0):
+        meta = {"source_filename": name, "page": page}
+        if page_text is not None:
+            meta["page_text"] = page_text
+        return app.Document(page_content=text, metadata=meta)
+
+    def test_build_db_stores_page_text_for_every_chunk(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            app, "OpenAIEmbeddings", return_value=LocalEmbeddings()
+        ):
+            pdf = Path(folder) / "table.pdf"
+            write_pdf(pdf, ["apple orchard", "banana plantation"])
+            db, _ = app.build_db([str(pdf)], "test")
+            stored = db.get(include=["metadatas"])["metadatas"]
+            db.delete_collection()
+        self.assertEqual({m["page"]: m["page_text"] for m in stored},
+                         {0: "apple orchard", 1: "banana plantation"})
+
+    def test_expands_to_page_once_and_keeps_order(self):
+        docs = [self.doc("row 3", "header\nrow 1\nrow 2\nrow 3", page=4),
+                self.doc("row 1", "header\nrow 1\nrow 2\nrow 3", page=4),
+                self.doc("other", "other page", page=7)]
+        expanded = app._expand_to_pages(docs)
+        self.assertEqual([d.page_content for d in expanded], ["header\nrow 1\nrow 2\nrow 3", "other page"])
+        self.assertEqual([d.metadata["page"] for d in expanded], [4, 7])
+        self.assertIn("a.pdf (p.5, 8)", app._format_sources(expanded))
+
+    def test_same_page_number_in_different_files_is_kept(self):
+        docs = [self.doc("x", "page of a", name="a.pdf"), self.doc("y", "page of b", name="b.pdf")]
+        self.assertEqual(len(app._expand_to_pages(docs)), 2)
+
+    def test_old_db_without_page_text_and_size_limit(self):
+        self.assertEqual(app._expand_to_pages([self.doc("only chunk")])[0].page_content, "only chunk")
+        big = "x" * (app.MAX_CONTEXT_CHARS - 100)   # 첫 페이지 후 남은 여유로는 다음 페이지 전체가 안 들어감
+        docs = [self.doc("c1", big, page=0), self.doc("c2", big, page=1)]
+        self.assertEqual([d.page_content for d in app._expand_to_pages(docs)], [big, "c2"])
+
+
 class AnswerCacheTest(unittest.TestCase):
     """#24: 새 PDF DB에서 이전 PDF의 캐시 답변이 반환되면 안 됨"""
 
