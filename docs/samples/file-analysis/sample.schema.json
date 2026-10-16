@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/chatpdf/file-analysis-sample.schema.json",
+  "title": "Local file analysis sample (ready document snapshot)",
+  "type": "object",
+  "properties": {
+    "documents": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "report_id": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "published_date": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "content_hash": {
+            "type": "string"
+          },
+          "mtime_ns": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "available": {
+            "type": "integer",
+            "enum": [
+              0,
+              1
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "report_id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "published_date": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "source_url": {
+                "type": "string"
+              },
+              "filename": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string"
+              },
+              "content_hash": {
+                "type": "string"
+              },
+              "analysis_status": {
+                "type": "string"
+              },
+              "analysis_error": {
+                "type": "string"
+              },
+              "analysis_version": {
+                "type": "string"
+              },
+              "topics": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "claims": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "available": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "report_id",
+              "title",
+              "published_date",
+              "summary",
+              "path",
+              "source_url",
+              "filename",
+              "category",
+              "content_hash",
+              "analysis_status",
+              "analysis_error",
+              "analysis_version",
+              "topics",
+              "claims",
+              "available"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "report_id",
+          "path",
+          "filename",
+          "title",
+          "published_date",
+          "category",
+          "content_hash",
+          "mtime_ns",
+          "size",
+          "available",
+          "status",
+          "error",
+          "version",
+          "payload"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "passages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "chunk_id": {
+            "type": "string"
+          },
+          "report_id": {
+            "type": "string"
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "chunk_id",
+          "report_id",
+          "page",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "documents",
+    "passages"
+  ],
+  "additionalProperties": false
+}
