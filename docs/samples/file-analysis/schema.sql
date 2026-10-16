@@ -10,4 +10,3 @@ CREATE TABLE documents (
 CREATE TABLE passages (chunk_id TEXT PRIMARY KEY, report_id TEXT NOT NULL, page INTEGER NOT NULL, text TEXT NOT NULL);
 
 CREATE VIRTUAL TABLE passage_fts USING fts5(chunk_id UNINDEXED, report_id UNINDEXED, text, tokenize='unicode61');
-
